@@ -1,6 +1,7 @@
 // PURE: no NinjaTrader types (tests compile this file).
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.Serialization;
 
 namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
@@ -12,7 +13,16 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         [DataMember(Name = "open_trades")] public List<OpenTrade> OpenTrades { get; set; }
         // A closed trade remains here until its outbox write succeeds, so an IO retry cannot lose the only copy.
         [DataMember(Name = "pending_closed")] public List<TradeRecord> PendingClosed { get; set; }
-        public OpenTradesState() { Version = 1; OpenTrades = new List<OpenTrade>(); PendingClosed = new List<TradeRecord>(); }
+        [DataMember(Name = "pending_provenance")] public List<PendingProvenance> PendingProvenance { get; set; }
+        [DataMember(Name = "invalidated")] public List<string> Invalidated { get; set; }
+        [DataMember(Name = "block_all")] public bool BlockAll { get; set; }
+        public OpenTradesState() { Version = 1; OpenTrades = new List<OpenTrade>(); PendingClosed = new List<TradeRecord>(); PendingProvenance = new List<PendingProvenance>(); Invalidated = new List<string>(); }
+    }
+    [DataContract]
+    public sealed class PendingProvenance
+    {
+        [DataMember] public string Key { get; set; }
+        [DataMember] public TradeProvenance Provenance { get; set; }
     }
     public sealed class OpenTradesFile
     {
@@ -27,7 +37,18 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             {
                 if (!files.Exists(path)) return new OpenTradesState();
                 OpenTradesState state;
-                if (Json.TryRead(files.Read(path), out state) && state.Version == 1 && state.OpenTrades != null && state.PendingClosed != null) return state;
+                if (Json.TryRead(files.Read(path), out state) && state.Version == 1 && state.OpenTrades != null && state.PendingClosed != null)
+                {
+                    state.PendingProvenance = state.PendingProvenance ?? new List<PendingProvenance>();
+                    state.Invalidated = state.Invalidated ?? new List<string>();
+                    foreach (var trade in state.PendingClosed)
+                    {
+                        var metadata = state.PendingProvenance.FirstOrDefault(x => x.Key == trade.Key);
+                        trade.Provenance = metadata == null ? null : metadata.Provenance;
+                        trade.RequiresValidation = true;
+                    }
+                    return state;
+                }
                 log("Could not read saved open trades. Positions will be treated as unknown starts."); return new OpenTradesState();
             }
             catch (Exception) { log(UiText.SaveFailed); throw; }

@@ -17,13 +17,23 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         {
             Builder = builder; openFile = file; outbox = queue;
             var state = openFile.Load(); Builder.Restore(state.OpenTrades); pending = state.PendingClosed;
+            outbox.ImportInvalidations(state.Invalidated, state.BlockAll);
+            DropInvalidated();
         }
         public void Apply(Fill fill)
         {
-            foreach (var trade in Builder.Process(fill)) if (!pending.Any(x => x.Key == trade.Key)) pending.Add(trade);
-            dirty = true;
-            RetryPersistence();
+            string operation = Builder.Operation(fill);
+            using (operation == "Update" || operation == "Remove" ? outbox.EnterMutation() : null)
+            {
+                if (operation == "Update" || operation == "Remove") { outbox.Correct(fill, pending); DropInvalidated(); }
+                foreach (var trade in Builder.Process(fill)) if (!pending.Any(x => x.Key == trade.Key)) pending.Add(trade);
+                if (pending.Count > 500) { pending.RemoveRange(0, pending.Count - 500); outbox.LogFull(); }
+                dirty = true;
+                RetryPersistence();
+            }
         }
+        private void DropInvalidated()
+        { var keys = new HashSet<string>(outbox.Invalidated, StringComparer.Ordinal); pending.RemoveAll(x => outbox.BlockAll || keys.Contains(x.Key)); }
         public void Reset(string account) { Builder.OnReset(account); dirty = true; RetryPersistence(); }
         public void Disable(string account) { Builder.DropAccount(account); dirty = true; RetryPersistence(); }
         public void PruneDisabledAccounts(Func<string, bool> isEnabled)
@@ -32,7 +42,19 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 Disable(account);
         }
         public void Resync(string account, IEnumerable<PositionSnapshot> positions, IEnumerable<string> executionIds)
-        { Builder.OnResync(account, positions, executionIds); dirty = true; RetryPersistence(); }
+        { Resync(account, new AccountSnapshot(positions, executionIds.Select(id => new ExecutionEvidence { ExecId = id }))); }
+        public void Resync(string account, AccountSnapshot snapshot)
+        {
+            using (outbox.EnterMutation())
+            {
+                Builder.OnResync(account, snapshot);
+                var rejected = pending.Where(x => x.RequiresValidation && (x.Provenance == null || !x.Provenance.Complete || x.Provenance.Account == account) &&
+                    (x.Provenance == null || !x.Provenance.VerifiedBy(account, snapshot))).Select(x => x.Key).ToList();
+                if (rejected.Count != 0) outbox.InvalidateRecords(rejected);
+                foreach (var trade in pending.Where(x => x.RequiresValidation && x.Provenance != null && x.Provenance.VerifiedBy(account, snapshot))) trade.RequiresValidation = false;
+                outbox.ValidateRestored(account, snapshot); DropInvalidated(); dirty = true; RetryPersistence();
+            }
+        }
         public bool RetryPersistence()
         {
             if (!dirty && !outbox.IsDirty) return true;
@@ -46,6 +68,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             dirty = !complete; return complete;
         }
         public OpenTradesState Snapshot()
-        { return new OpenTradesState { OpenTrades = Builder.Open, PendingClosed = pending.ToList() }; }
+        { return new OpenTradesState { OpenTrades = Builder.Open, PendingClosed = pending.ToList(),
+            PendingProvenance = pending.Select(x => new PendingProvenance { Key = x.Key, Provenance = x.Provenance }).ToList(),
+            Invalidated = outbox.Invalidated, BlockAll = outbox.BlockAll }; }
     }
 }

@@ -105,6 +105,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             internal FillCoordinator fills;
             internal AccountWatcher watcher;
             internal SessionCoordinator session;
+            private readonly AccountEventBoundary<Account> eventBoundary;
             private List<AccountChoice> accounts = new List<AccountChoice>();
             private volatile bool stopping;
             private volatile bool otherInstance;
@@ -114,6 +115,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             public Run(object owner)
             {
                 Owner = owner;
+                eventBoundary = new AccountEventBoundary<Account>(Queue);
                 folder = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "ZoneKeeper");
                 log = new EventLog(folder); log.Changed += Publish;
             }
@@ -134,7 +136,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             }
             public void QueueFill(Account source, Fill fill)
             {
-                Queue(() => {
+                eventBoundary.Fill(source, () => {
                     // A fill queued just before a checkbox was cleared must also be ignored.
                     if (!settings.IsEnabled(fill.Account) || watcher == null || !watcher.IsCurrent(source)) return;
                     if (settings.DebugFills)
@@ -146,13 +148,29 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 });
             }
             public void QueueReset(Account source)
-            { Queue(() => { if (watcher != null && watcher.IsCurrent(source)) fills.Reset(source.Name); }); }
-            public void QueueResync(Account account)
+            { eventBoundary.Fill(source, () => { if (watcher != null && watcher.IsCurrent(source)) fills.Reset(source.Name); }); }
+            public void QueueResync(Account account, Action beforeApply)
             {
-                Queue(() => {
-                    if (!settings.IsEnabled(account.Name) || watcher == null || !watcher.IsCurrent(account)) return;
+                eventBoundary.Request(account, action => Task.Run(() => {
+                    if (stopping) return;
+                    try { action(); }
+                    catch (Exception ex)
+                    {
+                        log.Error("Could not capture NinjaTrader positions", ex);
+                        Queue(() => {
+                            if (settings.IsEnabled(account.Name) && watcher != null && watcher.IsCurrent(account))
+                                fills.Resync(account.Name, new AccountSnapshot(new PositionSnapshot[0], new ExecutionEvidence[0], false));
+                        });
+                    }
+                }), CaptureAccount, beforeApply, (source, snapshot) => {
+                    if (!settings.IsEnabled(source.Name) || watcher == null || !watcher.IsCurrent(source)) return;
+                    fills.Resync(source.Name, snapshot);
+                });
+            }
+            private AccountSnapshot CaptureAccount(Account account)
+            {
+                return AccountSnapshot.Capture(() => {
                     var positions = new List<PositionSnapshot>();
-                    var ids = new List<string>();
                     lock (account.Positions)
                     {
                         foreach (var p in account.Positions)
@@ -163,8 +181,22 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                                 Currency = Helpers.CurrencyIso(p.Instrument.MasterInstrument.Currency.ToString()) });
                         }
                     }
-                    lock (account.Executions) foreach (var x in account.Executions) if (x != null) ids.Add(x.ExecutionId);
-                    fills.Resync(account.Name, positions, ids);
+                    return positions;
+                }, () => {
+                    var executions = new List<ExecutionEvidence>();
+                    lock (account.Executions)
+                        foreach (var x in account.Executions)
+                        {
+                            if (x == null || x.Instrument == null) continue;
+                            long ms;
+                            if (!Helpers.TryToUtcMs(x.Time, NinjaTrader.Core.Globals.GeneralOptions.TimeZoneInfo, out ms)) ms = 0;
+                            var master = x.Instrument.MasterInstrument;
+                            executions.Add(new ExecutionEvidence { ExecId = x.ExecutionId, Instrument = x.Instrument.FullName,
+                                IsBuy = x.MarketPosition == MarketPosition.Long, Qty = x.Quantity, Price = (decimal)x.Price,
+                                Commission = (decimal)x.Commission, TimeMs = ms, PositionAfter = x.Position,
+                                PointValue = (decimal)master.PointValue, Currency = Helpers.CurrencyIso(master.Currency.ToString()), Name = x.Name ?? "" });
+                        }
+                    return executions;
                 });
             }
             public void SetAccounts(List<AccountChoice> choices)
@@ -241,6 +273,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                             session = new SessionCoordinator(settings, outbox, api, log);
                             session.Changed += Publish; session.WorkAvailable += Wake;
                             outbox.DurableAdded += trade => { log.TradeClosed(trade); session.NotifyQueued(); };
+                            outbox.ReadyToSend += session.NotifyQueued;
                             break;
                         }
                         catch (Exception ex)

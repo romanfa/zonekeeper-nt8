@@ -30,5 +30,6 @@
     <Compile Include="../../src/ZoneKeeper/ApiClient.cs" Link="Src/ApiClient.cs" />
     <Compile Include="../../src/ZoneKeeper/SessionCoordinator.cs" Link="Src/SessionCoordinator.cs" />
     <Compile Include="../../src/ZoneKeeper/AccountIdentityMap.cs" Link="Src/AccountIdentityMap.cs" />
+    <Compile Include="../../src/ZoneKeeper/ResyncBoundary.cs" Link="Src/ResyncBoundary.cs" />
   </ItemGroup>
 </Project>

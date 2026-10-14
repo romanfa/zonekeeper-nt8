@@ -123,6 +123,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         [DataMember(Name = "local_date")] public string LocalDate { get; set; }
         // Local log metadata only; never part of the server JSON.
         public string LogExitNames { get; set; }
+        public TradeProvenance Provenance { get; set; }
+        public bool RequiresValidation { get; set; }
         public string Key { get { return Helpers.PairKey(Account, ExitExecId); } }
     }
 
@@ -136,6 +138,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         [DataMember] public decimal SourceCommission { get; set; }
         [DataMember] public bool IsBuy { get; set; }
         [DataMember] public bool IsEntry { get; set; }
+        [DataMember] public ExecutionEvidence Evidence { get; set; }
     }
 
     [DataContract]
@@ -158,8 +161,13 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         [DataMember] public bool Broken { get; set; }
         [DataMember] public List<AppliedFill> Fills { get; set; }
         [DataMember] public List<string> ExitNames { get; set; }
+        [DataMember] public List<ExecutionEvidence> ExecutionCheckpoint { get; set; }
+        [DataMember] public decimal? PositionAveragePrice { get; set; }
+        [DataMember] public bool EvidenceLimitExceeded { get; set; }
+        // A restored entry must be proved by a current snapshot before it can close safely.
+        public bool AwaitingContinuity { get; set; }
         public string Key { get { return Helpers.PairKey(Account, Instrument); } }
-        public bool Sendable { get { return !UnknownStart && !Broken && Helpers.CurrencyIso(Currency) != null; } }
+        public bool Sendable { get { return !UnknownStart && !Broken && !AwaitingContinuity && !EvidenceLimitExceeded && Helpers.CurrencyIso(Currency) != null; } }
 
         public static OpenTrade Start(Fill fill, int quantity, decimal commission)
         {
@@ -173,11 +181,16 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         }
         private void Remember(Fill fill, int quantity, bool entry)
         {
+            if (Fills.Count >= ExecutionEvidence.MaximumCount) { EvidenceLimitExceeded = true; return; }
             Fills.Add(new AppliedFill { ExecId = fill.ExecId, SourceQty = fill.Qty, AppliedQty = quantity,
-                Price = fill.Price, SourceCommission = fill.Commission, IsBuy = fill.IsBuy, IsEntry = entry });
+                Price = fill.Price, SourceCommission = fill.Commission, IsBuy = fill.IsBuy, IsEntry = entry,
+                Evidence = ExecutionEvidence.From(fill) });
         }
         public void AddEntry(Fill fill, int quantity, decimal commission)
         {
+            long remaining = Math.Abs((long)Net);
+            PositionAveragePrice = remaining == 0 ? fill.Price :
+                ((PositionAveragePrice ?? fill.Price) * remaining + quantity * fill.Price) / (remaining + quantity);
             Net = checked(Net + (IsLong ? quantity : -quantity));
             EntryQty = checked(EntryQty + quantity); EntryValue += quantity * fill.Price; Commission += commission;
             if (EntryExecIds.Count < 10) EntryExecIds.Add(Helpers.SafeId(fill.ExecId));
@@ -203,8 +216,67 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 CommissionCents = commission, PnlCents = Helpers.Cents(gross) - commission,
                 Currency = Currency, PointValue = (double)PointValue, ExitExecId = Helpers.SafeId(closingFill.ExecId),
                 EntryExecIds = new List<string>(EntryExecIds), ExitName = exitName.Length == 0 ? null : exitName,
-                LocalDate = Helpers.LocalDate(closingFill.TimeMs, localZone), LogExitNames = string.Join(", ", ExitNames)
+                LocalDate = Helpers.LocalDate(closingFill.TimeMs, localZone), LogExitNames = string.Join(", ", ExitNames),
+                Provenance = new TradeProvenance { Account = Account, Instrument = Instrument,
+                    Executions = Fills.ConvertAll(x => x.Evidence == null ? null : x.Evidence.Copy()) }
             };
+        }
+    }
+
+    [DataContract]
+    public sealed class ExecutionEvidence
+    {
+        public const int MaximumCount = 5000;
+        [DataMember] public string ExecId { get; set; }
+        [DataMember] public string Instrument { get; set; }
+        [DataMember] public bool IsBuy { get; set; }
+        [DataMember] public int Qty { get; set; }
+        [DataMember] public decimal Price { get; set; }
+        [DataMember] public decimal Commission { get; set; }
+        [DataMember] public long TimeMs { get; set; }
+        [DataMember] public int PositionAfter { get; set; }
+        [DataMember] public decimal PointValue { get; set; }
+        [DataMember] public string Currency { get; set; }
+        [DataMember] public string Name { get; set; }
+        public static ExecutionEvidence From(Fill fill)
+        {
+            return new ExecutionEvidence { ExecId = fill.ExecId, Instrument = fill.Instrument, IsBuy = fill.IsBuy,
+                Qty = fill.Qty, Price = fill.Price, Commission = fill.Commission, TimeMs = fill.TimeMs,
+                PositionAfter = fill.PositionAfter, PointValue = fill.PointValue, Currency = fill.Currency, Name = fill.Name ?? "" };
+        }
+        public ExecutionEvidence Copy() { return (ExecutionEvidence)MemberwiseClone(); }
+        public bool Complete { get { return !string.IsNullOrEmpty(ExecId) && !string.IsNullOrEmpty(Instrument) &&
+            Qty > 0 && TimeMs > 0 && PointValue > 0 && Currency != null; } }
+        public bool Matches(ExecutionEvidence other)
+        {
+            return other != null && ExecId == other.ExecId && Instrument == other.Instrument && IsBuy == other.IsBuy &&
+                Qty == other.Qty && Price == other.Price && Commission == other.Commission && TimeMs == other.TimeMs &&
+                PositionAfter == other.PositionAfter && PointValue == other.PointValue && Currency == other.Currency && Name == other.Name;
+        }
+    }
+    [DataContract]
+    public sealed class TradeProvenance
+    {
+        [DataMember] public string Account { get; set; }
+        [DataMember] public string Instrument { get; set; }
+        [DataMember] public List<ExecutionEvidence> Executions { get; set; }
+        public bool Complete { get { return !string.IsNullOrEmpty(Account) && !string.IsNullOrEmpty(Instrument) &&
+            Executions != null && Executions.Count > 0 && Executions.Count <= ExecutionEvidence.MaximumCount &&
+            Executions.TrueForAll(x => x != null && x.Complete && x.Instrument == Instrument); } }
+        public bool AffectedBy(Fill fill)
+        {
+            // Without full provenance an unrelated correction cannot safely be ruled out.
+            return !Complete || (Account == fill.Account && Executions.Exists(x => x.ExecId == fill.ExecId));
+        }
+        public bool VerifiedBy(string account, AccountSnapshot snapshot)
+        {
+            if (!Complete || Account != account || !snapshot.Consistent) return false;
+            var history = snapshot.Executions.FindAll(x => x.Instrument == Instrument);
+            int first = history.FindIndex(x => x.ExecId == Executions[0].ExecId);
+            if (first < 0 || first + Executions.Count > history.Count) return false;
+            // Every fill in the closed trade's interval must be accounted for, including partial exits.
+            for (int i = 0; i < Executions.Count; i++) if (!Executions[i].Matches(history[first + i])) return false;
+            return true;
         }
     }
 

@@ -23,13 +23,16 @@ Each closed trade sends `account`, `instrument`, `side`, `qty`, `entry_time`, `e
 
 Connecting also sends the PC name and add-on version. The add-on uses a device key, not the browser login cookie. It does not import past trading days. Open positions with an unknown start are followed but are not sent. Two PCs sending the same account and exit execution ID produce one saved trade.
 
+After a restart or reconnect, saved open trades require unchanged execution history, position direction, size and average price. Waiting trades restored from disk require complete unchanged fill history before upload. Missing or amended history leaves uncertain trades unsent and writes the reason to the log. An execution Update or Remove invalidates affected waiting trades; a trade already dispatched to the server cannot be changed locally.
+
 Local files live in `Documents\NinjaTrader 8\ZoneKeeper\` (the NinjaTrader user folder may be redirected, for example to OneDrive):
 
 | File | Purpose |
 | --- | --- |
 | `settings.json` | Account choices and device key protected with Windows DPAPI for the current Windows user. |
-| `outbox.jsonl` | Up to 500 closed trades waiting to send. The oldest is dropped, with a log entry, when full. |
-| `open-trades.json` | Open trades and pending closed trades, saved as a checkpoint. |
+| `outbox.jsonl` | Up to 500 closed trades waiting to send, with local fill provenance. The oldest is dropped, with a log entry, when full. |
+| `outbox.jsonl.invalidations` | Durable safety records that prevent corrected or removed fills from being uploaded again. |
+| `open-trades.json` | Open trades, execution checkpoints, pending closed trades and local safety metadata. |
 | `zonekeeper.log`, `zonekeeper.1.log` | Event log and rotated log. Codes and device keys are not logged. |
 | `running.lock` | Keeps one engine active for this Windows user. |
 

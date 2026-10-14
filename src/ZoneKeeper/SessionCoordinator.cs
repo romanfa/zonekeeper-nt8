@@ -159,8 +159,10 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public async Task ProcessAsync(long nowMs, CancellationToken cancellation)
         {
             await serial.WaitAsync(cancellation).ConfigureAwait(false);
+            IDisposable sendGuard = null;
             try
             {
+                sendGuard = await outbox.EnterSendAsync(cancellation).ConfigureAwait(false);
                 if (cancellation.IsCancellationRequested) return;
                 if (!outbox.TryFlush() || !settings.TrySave())
                 {
@@ -216,7 +218,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     Apply(result, nowMs);
                     if (result.Kind == ApiKind.Ok)
                     {
-                        int remaining = outbox.Count;
+                        int remaining = outbox.Peek(1).Count;
                         lock (stateGate) { clockOffsetMs = answer.ServerTime - nowMs; if (remaining != 0) nextTryMs = nowMs; }
                         string warning = UiText.ClockWarning(clockOffsetMs);
                         if (warning.Length != 0) log.Write(warning);
@@ -226,7 +228,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             }
             catch (OperationCanceledException) { }
             catch (Exception ex) { log.Error("Could not send waiting trades", ex); Apply(new ApiResult { Kind = ApiKind.Offline }, nowMs); Publish(); }
-            finally { serial.Release(); }
+            finally { if (sendGuard != null) sendGuard.Dispose(); serial.Release(); }
         }
         private static bool ValidTradesAnswer(TradesAnswer answer, int count)
         {

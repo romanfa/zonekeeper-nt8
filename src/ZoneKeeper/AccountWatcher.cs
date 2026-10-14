@@ -19,13 +19,13 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private readonly EventLog log;
         private readonly Action<Account, Fill> fill;
         private readonly Action<Account> reset;
-        private readonly Action<Account> resync;
+        private readonly Action<Account, Action> resync;
         private readonly Action<Action> queue;
         private readonly Action<List<AccountChoice>> accountsChanged;
         private Timer timer;
         private bool stopped;
         public AccountWatcher(Settings localSettings, EventLog eventLog, Action<Account, Fill> onFill, Action<Account> onReset,
-            Action<Account> onResync, Action<Action> enqueue, Action<List<AccountChoice>> onAccounts)
+            Action<Account, Action> onResync, Action<Action> enqueue, Action<List<AccountChoice>> onAccounts)
         { settings = localSettings; allowPlayback = localSettings.AllowPlayback; log = eventLog; fill = onFill; reset = onReset; resync = onResync; queue = enqueue; accountsChanged = onAccounts; }
         public void Start()
         {
@@ -81,7 +81,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     foreach (var account in active.Values)
                     {
                         if (subscriptions.ContainsKey(account.Name)) continue;
-                        account.ExecutionUpdate += OnExecutionUpdate; subscriptions.Add(account.Name, account); resync(account);
+                        account.ExecutionUpdate += OnExecutionUpdate; subscriptions.Add(account.Name, account); resync(account, null);
                     }
                 }
                 accountsChanged(all.Select(x => new AccountChoice { Name = x.Name, Enabled = settings.IsEnabled(x.Name) }).OrderBy(x => x.Name).ToList());
@@ -98,7 +98,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             try
             {
                 Account account = e.Account; bool connected = e.Status.ToString() == "Connected";
-                queue(() => { Rescan(); if (connected && account != null && IsCurrent(account)) resync(account); });
+                if (connected && account != null) resync(account, Rescan);
+                else queue(Rescan);
             }
             catch (Exception) { }
         }

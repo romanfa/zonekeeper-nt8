@@ -11,6 +11,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private readonly Dictionary<string, OpenTrade> open = new Dictionary<string, OpenTrade>(StringComparer.Ordinal);
         private readonly HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
         private readonly Queue<string> seenOrder = new Queue<string>();
+        private readonly Dictionary<string, List<ExecutionEvidence>> histories = new Dictionary<string, List<ExecutionEvidence>>(StringComparer.Ordinal);
         private readonly TimeZoneInfo localZone;
         private readonly Action<string> log;
         public TradeBuilder(TimeZoneInfo zone, Action<string> writeLog)
@@ -27,6 +28,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     t.EntryQty <= 0 || t.PointValue <= 0 || t.Fills == null || t.EntryExecIds == null || t.ExitNames == null)
                 { log("Skipped invalid saved open trade."); continue; }
                 open[t.Key] = t;
+                t.AwaitingContinuity = true;
+                if (t.ExecutionCheckpoint != null) histories[t.Key] = t.ExecutionCheckpoint.Where(x => x != null).Take(ExecutionEvidence.MaximumCount).Select(x => x.Copy()).ToList();
                 foreach (var fill in t.Fills) Remember(t.Account, fill.ExecId);
             }
         }
@@ -40,12 +43,29 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         }
         public List<TradeRecord> Process(Fill fill)
         {
-            string operation = fill.Op;
-            if (string.IsNullOrEmpty(operation)) operation = seen.Contains(Helpers.PairKey(fill.Account, fill.ExecId)) ? "Update" : "Add";
+            string operation = Operation(fill);
             if (operation == "Update") { OnUpdate(fill); return new List<TradeRecord>(); }
             if (operation == "Remove") { OnRemove(fill); return new List<TradeRecord>(); }
             if (operation != "Add") { log("Skipped an unknown fill operation."); return new List<TradeRecord>(); }
             return OnAdd(fill);
+        }
+        public string Operation(Fill fill)
+        { return string.IsNullOrEmpty(fill.Op) ? (seen.Contains(Helpers.PairKey(fill.Account, fill.ExecId)) ? "Update" : "Add") : fill.Op; }
+        private void Track(Fill fill)
+        {
+            List<ExecutionEvidence> history;
+            if (!histories.TryGetValue(fill.Key, out history)) histories[fill.Key] = history = new List<ExecutionEvidence>();
+            int existing = history.FindIndex(x => x.ExecId == fill.ExecId);
+            if (existing >= 0) history[existing] = ExecutionEvidence.From(fill);
+            else history.Add(ExecutionEvidence.From(fill));
+            if (history.Count > ExecutionEvidence.MaximumCount) history.RemoveRange(0, history.Count - ExecutionEvidence.MaximumCount);
+        }
+        private void Checkpoint(OpenTrade trade)
+        {
+            if (trade.EvidenceLimitExceeded && !trade.Broken)
+            { trade.Broken = true; log("Not sent: this trade exceeded the local execution-evidence limit (" + trade.Account + " · " + trade.Instrument + ")."); }
+            List<ExecutionEvidence> history;
+            trade.ExecutionCheckpoint = histories.TryGetValue(trade.Key, out history) ? history.Select(x => x.Copy()).ToList() : null;
         }
         public List<TradeRecord> OnAdd(Fill f)
         {
@@ -54,29 +74,35 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             if (!Remember(f.Account, f.ExecId)) return closed;
             if (!f.IsPlayback && f.ArrivedMs - f.TimeMs > 15 * 60000L)
             { log("Skipped an old fill (from before ZoneKeeper started)."); return closed; }
+            Track(f);
             OpenTrade trade; open.TryGetValue(f.Key, out trade);
             int signed = f.IsBuy ? f.Qty : -f.Qty;
             if (trade == null)
             {
-                trade = OpenTrade.Start(f, f.Qty, f.Commission); open[f.Key] = trade;
+                trade = OpenTrade.Start(f, f.Qty, f.Commission); Checkpoint(trade); open[f.Key] = trade;
                 Check(trade, f.PositionAfter); DropBrokenFlat(trade, f); return closed;
             }
             if (Math.Sign(signed) == Math.Sign(trade.Net))
             {
-                trade.AddEntry(f, f.Qty, f.Commission); Check(trade, f.PositionAfter); DropBrokenFlat(trade, f); return closed;
+                trade.AddEntry(f, f.Qty, f.Commission); Checkpoint(trade); Check(trade, f.PositionAfter); DropBrokenFlat(trade, f); return closed;
             }
             int closeQty = Math.Min(f.Qty, Math.Abs(trade.Net));
             decimal closeCommission = f.Commission * closeQty / f.Qty;
             trade.AddExit(f, closeQty, closeCommission);
+            Checkpoint(trade);
             if (trade.Net != 0) { Check(trade, f.PositionAfter); DropBrokenFlat(trade, f); return closed; }
             open.Remove(f.Key);
             int rest = f.Qty - closeQty;
-            if (Math.Abs((long)f.PositionAfter) != rest) MarkBroken(trade);
+            int expectedRemainder = f.IsBuy ? rest : -rest;
+            bool mismatch = f.PositionAfter != expectedRemainder;
+            if (mismatch) MarkBroken(trade);
             if (trade.Sendable) closed.Add(trade.ToRecord(f, localZone));
             else NotSent(trade);
             if (rest > 0)
             {
                 var next = OpenTrade.Start(f, rest, f.Commission - closeCommission); open[f.Key] = next;
+                Checkpoint(next);
+                if (mismatch || trade.Broken || trade.AwaitingContinuity) MarkBroken(next);
                 Check(next, f.PositionAfter); DropBrokenFlat(next, f);
             }
             return closed;
@@ -87,7 +113,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         }
         private void Check(OpenTrade trade, int position)
         {
-            if (Math.Abs((long)trade.Net) != Math.Abs((long)position)) MarkBroken(trade);
+            if (trade.Net != position) MarkBroken(trade);
         }
         private void DropBrokenFlat(OpenTrade trade, Fill fill)
         {
@@ -95,30 +121,40 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         }
         private void NotSent(OpenTrade trade)
         {
-            string why = trade.UnknownStart ? "this trade started before ZoneKeeper was running" :
+            string why = trade.UnknownStart || trade.AwaitingContinuity ? "the start or continuity of this trade could not be verified" :
                 trade.Broken ? "ZoneKeeper missed a fill of this trade" : "currency " + (trade.Currency ?? "unknown") + " is not supported yet";
             log("Not sent: " + why + " (" + trade.Account + " · " + trade.Instrument + ").");
         }
         public void OnUpdate(Fill f)
         {
-            OpenTrade trade; AppliedFill applied;
-            if (!open.TryGetValue(f.Key, out trade) || (applied = trade.Fills.FirstOrDefault(x => x.ExecId == f.ExecId)) == null)
-            { log("A fill changed after its trade closed; saved trades cannot be changed."); return; }
-            if (f.Qty != applied.SourceQty || f.Price != applied.Price || f.IsBuy != applied.IsBuy) MarkBroken(trade);
-            else
+            var affected = open.Values.Where(x => x.Account == f.Account && x.Fills.Any(y => y.ExecId == f.ExecId)).ToList();
+            if (affected.Count == 0)
+            { log("A closed fill changed; affected waiting trades are invalidated. Already dispatched trades cannot be changed."); return; }
+            foreach (var trade in affected)
             {
-                // A reversal fill belongs partly to the old trade and partly to the new one.
-                trade.Commission += (f.Commission - applied.SourceCommission) * applied.AppliedQty / applied.SourceQty;
-                applied.SourceCommission = f.Commission;
+                var applied = trade.Fills.First(x => x.ExecId == f.ExecId);
+                var evidence = ExecutionEvidence.From(f);
+                evidence.Commission = applied.SourceCommission;
+                if (applied.Evidence == null || !applied.Evidence.Matches(evidence)) MarkBroken(trade);
+                else
+                {
+                    // A reversal fill belongs partly to the old trade and partly to the new one.
+                    trade.Commission += (f.Commission - applied.SourceCommission) * applied.AppliedQty / applied.SourceQty;
+                    applied.SourceCommission = f.Commission;
+                    applied.Evidence = ExecutionEvidence.From(f);
+                }
+                Track(f); Checkpoint(trade);
+                DropBrokenFlat(trade, f);
             }
-            DropBrokenFlat(trade, f);
         }
         public void OnRemove(Fill f)
         {
-            OpenTrade trade;
-            if (open.TryGetValue(f.Key, out trade) && trade.Fills.Any(x => x.ExecId == f.ExecId))
-            { MarkBroken(trade); DropBrokenFlat(trade, f); }
-            else log("A fill was removed after its trade closed; saved trades cannot be changed.");
+            var affected = open.Values.Where(x => x.Account == f.Account && x.Fills.Any(y => y.ExecId == f.ExecId)).ToList();
+            if (affected.Count != 0)
+                foreach (var trade in affected) { MarkBroken(trade); DropBrokenFlat(trade, f); }
+            else log("A closed fill was removed; affected waiting trades are invalidated. Already dispatched trades cannot be changed.");
+            List<ExecutionEvidence> history;
+            if (histories.TryGetValue(f.Key, out history)) history.RemoveAll(x => x.ExecId == f.ExecId);
         }
         public void OnReset(string account)
         {
@@ -130,16 +166,31 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         }
         public void OnResync(string account, IEnumerable<PositionSnapshot> positions, IEnumerable<string> executionIds)
         {
-            foreach (string id in executionIds) if (!string.IsNullOrEmpty(id)) Remember(account, id);
+            OnResync(account, new AccountSnapshot(positions, executionIds.Select(id => new ExecutionEvidence { ExecId = id })));
+        }
+        public void OnResync(string account, AccountSnapshot snapshot)
+        {
+            var positions = snapshot.Positions; var evidence = snapshot.Executions;
+            if (snapshot.Consistent) foreach (var x in evidence) if (!string.IsNullOrEmpty(x.ExecId)) Remember(account, x.ExecId);
             var current = positions.Where(x => x.Net != 0).ToDictionary(x => Helpers.PairKey(account, x.Instrument), StringComparer.Ordinal);
             foreach (var t in open.Values.Where(x => x.Account == account).ToList())
             {
                 PositionSnapshot p;
-                if (current.TryGetValue(t.Key, out p) && p.Net == t.Net)
+                var expected = t.ExecutionCheckpoint;
+                var actual = evidence.Where(x => x.Instrument == t.Instrument).ToList();
+                bool continuous = snapshot.Consistent && expected != null && expected.Count > 0 && expected.Count <= ExecutionEvidence.MaximumCount &&
+                    actual.Count == expected.Count && expected.Zip(actual, (x, y) => x != null && x.Complete && x.Matches(y)).All(x => x);
+                if (current.TryGetValue(t.Key, out p) && p.Net == t.Net && t.PositionAveragePrice.HasValue &&
+                    p.AveragePrice == t.PositionAveragePrice.Value && p.PointValue == t.PointValue && p.Currency == t.Currency && continuous)
+                {
+                    t.AwaitingContinuity = false;
                     log("Resumed an open trade: " + account + " · " + t.Instrument + " · " + (t.IsLong ? "long " : "short ") + Math.Abs(t.Net) + ".");
+                }
                 else
-                { open.Remove(t.Key); log("Not sent: the position changed while ZoneKeeper did not see it (" + account + " · " + t.Instrument + ")."); }
+                { open.Remove(t.Key); log("Not sent: execution continuity could not be proved (" + account + " · " + t.Instrument + ")."); }
             }
+            foreach (var group in evidence.Where(x => x.Complete).GroupBy(x => x.Instrument))
+                histories[Helpers.PairKey(account, group.Key)] = group.Take(ExecutionEvidence.MaximumCount).Select(x => x.Copy()).ToList();
             foreach (var p in current.Values)
             {
                 string key = Helpers.PairKey(account, p.Instrument);

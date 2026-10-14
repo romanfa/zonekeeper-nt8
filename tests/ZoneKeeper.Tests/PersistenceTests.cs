@@ -20,6 +20,7 @@ namespace ZoneKeeper.Tests
             Assert.Equal("exit1", queue.Peek(1)[0].Trade.ExitExecId);
             Assert.True(queue.Add(Fixtures.Trade("exit500"))); Assert.Equal(500, queue.Count);
             var reloaded = new OutboxQueue("queue", files, messages.Add);
+            Fixtures.VerifyPersisted(reloaded, files);
             Assert.Equal(500, reloaded.Count); Assert.True(reloaded.Remove(reloaded.Peek(20).Select(x => x.Identity)));
             Assert.Equal(480, new OutboxQueue("queue", files, messages.Add).Count);
         }
@@ -48,7 +49,9 @@ namespace ZoneKeeper.Tests
             q.DurableAdded += delegate { closed++; };
             Assert.False(q.Add(Fixtures.Trade())); Assert.Equal(1, q.Count); Assert.Empty(q.Peek(20)); Assert.Equal(0, closed);
             files.FailWrites = null; Assert.True(q.TryFlush()); Assert.Equal(1, closed);
-            Assert.True(q.Add(Fixtures.Trade())); Assert.Equal(1, closed); Assert.Single(new OutboxQueue("queue", files, delegate { }).Peek(20));
+            Assert.True(q.Add(Fixtures.Trade())); Assert.Equal(1, closed);
+            var restored = new OutboxQueue("queue", files, delegate { }); Assert.Empty(restored.Peek(20));
+            Fixtures.VerifyPersisted(restored, files); Assert.Single(restored.Peek(20));
         }
         [Fact]
         public void FailedBatchRemovalPreservesMemoryAndDiskForRetry()
@@ -71,7 +74,9 @@ namespace ZoneKeeper.Tests
             files.FailWrites = null;
             var restartedQueue = new OutboxQueue("queue", files, delegate { });
             var restarted = new FillCoordinator(new TradeBuilder(TimeZoneInfo.Utc, delegate { }), file, restartedQueue);
-            Assert.True(restarted.RetryPersistence()); Assert.Single(restartedQueue.Peek(20)); Assert.Empty(file.Load().PendingClosed);
+            Assert.True(restarted.RetryPersistence()); Assert.Empty(restartedQueue.Peek(20));
+            restarted.Resync("Sim101", Fixtures.Snapshot(new[] { Fixtures.Fill("a", true, 1, 100, 1), Fixtures.Fill("b", false, 1, 101, 0) }));
+            Assert.Single(restartedQueue.Peek(20)); Assert.Empty(file.Load().PendingClosed);
         }
         [Fact]
         public void SimultaneousFileFailuresRetainPendingInMemoryUntilRecovery()

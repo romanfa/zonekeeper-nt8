@@ -16,7 +16,7 @@ namespace ZoneKeeper.Tests
         public void T1_T2_MnqLongAndShortNet4340(bool buy)
         {
             var b = Builder();
-            Assert.Empty(b.OnAdd(Fixtures.Fill("entry", buy, 2, buy ? 21034.25m : 21045.75m, 2, 1.30m)));
+            Assert.Empty(b.OnAdd(Fixtures.Fill("entry", buy, 2, buy ? 21034.25m : 21045.75m, buy ? 2 : -2, 1.30m)));
             var trade = Assert.Single(b.OnAdd(Fixtures.Fill("exit", !buy, 2, buy ? 21045.75m : 21034.25m, 0, 1.30m)));
             Assert.Equal(4340, trade.PnlCents); Assert.Equal(260, trade.CommissionCents);
             Assert.Equal(buy ? "long" : "short", trade.Side); Assert.Empty(b.Open);
@@ -61,7 +61,7 @@ namespace ZoneKeeper.Tests
         public void T7_PartialFillThenReversal()
         {
             var b = Builder(); b.OnAdd(Fixtures.Fill("a", true, 2, 100, 2)); b.OnAdd(Fixtures.Fill("b", false, 1, 101, 1));
-            var old = Assert.Single(b.OnAdd(Fixtures.Fill("c", false, 2, 102, 1)));
+            var old = Assert.Single(b.OnAdd(Fixtures.Fill("c", false, 2, 102, -1)));
             var next = Assert.Single(b.OnAdd(Fixtures.Fill("d", true, 1, 100, 0)));
             Assert.Equal(600, old.PnlCents); Assert.Equal(400, next.PnlCents);
         }
@@ -90,6 +90,7 @@ namespace ZoneKeeper.Tests
         {
             var b = Builder(); b.OnAdd(Fixtures.Fill("a", true, 1, 100, 1, .1m));
             var restored = Builder(); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(b.Open)));
+            restored.OnResync("Sim101", Fixtures.Snapshot(new[] { Fixtures.Fill("a", true, 1, 100, 1, .1m) }, Fixtures.Position(1)));
             var update = Fixtures.Fill("a", true, 1, 100, 1, .7m); update.Op = "Update";
             restored.Process(update); restored.Process(update);
             var trade = Assert.Single(restored.OnAdd(Fixtures.Fill("b", false, 1, 101, 0, .3m)));
@@ -98,9 +99,10 @@ namespace ZoneKeeper.Tests
         [Fact]
         public void LateReversalCommissionUsesOnlyItsRemainingFraction()
         {
-            var b = Builder(); b.OnAdd(Fixtures.Fill("a", true, 2, 100, 2)); b.OnAdd(Fixtures.Fill("flip", false, 3, 110, 1, 3));
+            var b = Builder(); b.OnAdd(Fixtures.Fill("a", true, 2, 100, 2)); b.OnAdd(Fixtures.Fill("flip", false, 3, 110, -1, 3));
             var restored = Builder(); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(b.Open)));
-            var update = Fixtures.Fill("flip", false, 3, 110, 1, 6); update.Op = "Update"; restored.Process(update);
+            restored.OnResync("Sim101", Fixtures.Snapshot(new[] { Fixtures.Fill("a", true, 2, 100, 2), Fixtures.Fill("flip", false, 3, 110, -1, 3) }, Fixtures.Position(-1, 110)));
+            var update = Fixtures.Fill("flip", false, 3, 110, -1, 6); update.Op = "Update"; restored.Process(update);
             var trade = Assert.Single(restored.OnAdd(Fixtures.Fill("end", true, 1, 109, 0)));
             Assert.Equal(200, trade.CommissionCents); Assert.Equal(0, trade.PnlCents);
         }
@@ -134,9 +136,10 @@ namespace ZoneKeeper.Tests
         [Fact]
         public void T15_ResyncChecksSignedSizeAndSeedsOldExecutions()
         {
-            var b = Builder(); b.OnAdd(Fixtures.Fill("a", true, 1, 100, 1));
+            var old = Fixtures.Fill("old", false, 1, 101, 0); old.TimeMs -= 1000000;
+            var b = Builder(); b.OnResync("Sim101", Fixtures.Snapshot(new[] { old })); b.OnAdd(Fixtures.Fill("a", true, 1, 100, 1));
             var restored = Builder(); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(b.Open)));
-            restored.OnResync("Sim101", new[] { new PositionSnapshot { Instrument = "MNQ 12-26", Net = 1, PointValue = 2, Currency = "USD" } }, new[] { "a", "old" });
+            restored.OnResync("Sim101", Fixtures.Snapshot(new[] { old, Fixtures.Fill("a", true, 1, 100, 1) }, Fixtures.Position(1)));
             Assert.False(Assert.Single(restored.Open).UnknownStart);
             Assert.Empty(restored.OnAdd(Fixtures.Fill("old", false, 1, 101, 0)));
             Assert.Single(restored.OnAdd(Fixtures.Fill("b", false, 1, 101, 0)));
@@ -174,7 +177,7 @@ namespace ZoneKeeper.Tests
         [Fact]
         public void EsCommissionAndFlatGross()
         {
-            var b = Builder(); var a = Fixtures.Fill("a", false, 2, 4300, 2, 2.5m, "Sim101", "ES 12-26"); a.PointValue = 50;
+            var b = Builder(); var a = Fixtures.Fill("a", false, 2, 4300, -2, 2.5m, "Sim101", "ES 12-26"); a.PointValue = 50;
             var z = Fixtures.Fill("z", true, 2, 4300, 0, 2.5m, "Sim101", "ES 12-26"); z.PointValue = 50;
             b.OnAdd(a); var trade = Assert.Single(b.OnAdd(z)); Assert.Equal(500, trade.CommissionCents); Assert.Equal(-500, trade.PnlCents);
         }

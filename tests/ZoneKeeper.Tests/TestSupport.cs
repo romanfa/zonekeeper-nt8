@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Text;
 using System.Threading;
@@ -88,9 +89,24 @@ namespace ZoneKeeper.Tests
         }
         public static TradeRecord Trade(string id = "exit", string account = "Sim101")
         {
-            return new TradeRecord { Account = account, Instrument = "MNQ 12-26", Side = "long", Qty = 2, EntryTime = Time, ExitTime = Time + 420000,
+            int sequence; if (!id.StartsWith("exit", StringComparison.Ordinal) || !int.TryParse(id.Substring(4), out sequence)) sequence = 0;
+            var entry = Fill(id == "exit" ? "entry" : "entry:" + id, true, 2, 21034.25m, 2, 1.30m, account); entry.TimeMs += sequence * 600000L;
+            var exit = Fill(id, false, 2, 21045.75m, 0, 1.30m, account); exit.TimeMs = entry.TimeMs + 420000;
+            return new TradeRecord { Account = account, Instrument = "MNQ 12-26", Side = "long", Qty = 2, EntryTime = entry.TimeMs, ExitTime = exit.TimeMs,
                 EntryPrice = 21034.25, ExitPrice = 21045.75, PnlCents = 4340, CommissionCents = 260, Currency = "USD", PointValue = 2,
-                ExitExecId = id, EntryExecIds = new List<string> { "entry" }, LocalDate = "2026-10-13", ExitName = "Target1" };
+                ExitExecId = id, EntryExecIds = new List<string> { entry.ExecId }, LocalDate = "2026-10-13", ExitName = "Target1",
+                Provenance = new TradeProvenance { Account = account, Instrument = entry.Instrument,
+                    Executions = new List<ExecutionEvidence> { ExecutionEvidence.From(entry), ExecutionEvidence.From(exit) } } };
+        }
+        public static AccountSnapshot Snapshot(IEnumerable<Fill> fills, params PositionSnapshot[] positions)
+        { return new AccountSnapshot(positions, fills.Select(ExecutionEvidence.From)); }
+        public static PositionSnapshot Position(int net, decimal price = 100)
+        { return new PositionSnapshot { Instrument = "MNQ 12-26", Net = net, AveragePrice = price, PointValue = 2, Currency = "USD" }; }
+        public static void VerifyPersisted(OutboxQueue queue, MemoryFiles files, string path = "queue")
+        {
+            foreach (var account in files.Read(path).Split('\n').Where(x => !string.IsNullOrWhiteSpace(x)).Select(Json.Read<OutboxLine>)
+                .Where(x => x.Provenance != null).GroupBy(x => x.Provenance.Account))
+                queue.ValidateRestored(account.Key, new AccountSnapshot(new PositionSnapshot[0], account.SelectMany(x => x.Provenance.Executions).OrderBy(x => x.TimeMs)));
         }
         public static ApiResult Claim()
         { return new ApiResult { Kind = ApiKind.Ok, Status = 200, Body = new ClaimAnswer { Token = Token, DeviceId = 7, EmailMasked = "r***@gmail.com" } }; }
