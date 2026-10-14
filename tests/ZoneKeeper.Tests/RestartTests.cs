@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using NinjaTrader.NinjaScript.AddOns.ZoneKeeper;
 using Xunit;
 
@@ -8,6 +10,20 @@ namespace ZoneKeeper.Tests
 {
     public sealed class RestartTests
     {
+        private sealed class DispatchApi : IAddonApi
+        {
+            public readonly FakeApi Inner = new FakeApi();
+            public readonly List<TradeRecord> Sent = new List<TradeRecord>();
+            public Task<ApiResult> ClaimAsync(string code, string name, CancellationToken cancellation)
+            { return Inner.ClaimAsync(code, name, cancellation); }
+            public Task<ApiResult> PingAsync(string token, CancellationToken cancellation)
+            { return Inner.PingAsync(token, cancellation); }
+            public Task<ApiResult> SendTradesAsync(string token, List<TradeRecord> trades, CancellationToken cancellation)
+            { Sent.AddRange(trades); return Inner.SendTradesAsync(token, trades, cancellation); }
+            public Task<ApiResult> DisconnectAsync(string token, CancellationToken cancellation)
+            { return Inner.DisconnectAsync(token, cancellation); }
+            public void Dispose() { Inner.Dispose(); }
+        }
         private sealed class Harness
         {
             public readonly MemoryFiles Files = new MemoryFiles();
@@ -35,6 +51,43 @@ namespace ZoneKeeper.Tests
                 Assert.Equal(200, trade.PnlCents); Assert.Equal(new[] { "entry-" + suffix }, trade.EntryExecIds);
                 Assert.DoesNotContain(Worker.Builder.Open, x => x.Account == "Sim101" && x.Instrument == "MNQ 12-26");
             }
+        }
+        private static ExecutionEvidence Amend(ExecutionEvidence original, string changed)
+        {
+            var amended = original.Copy();
+            switch (changed)
+            {
+                case "commission": amended.Commission += 1; break;
+                case "price": amended.Price++; break;
+                case "quantity": amended.Qty++; break;
+                case "side": amended.IsBuy = !amended.IsBuy; break;
+                case "time": amended.TimeMs++; break;
+                case "instrument": amended.Instrument = "MNQ 03-27"; break;
+                case "position-after": amended.PositionAfter++; break;
+                case "point-value": amended.PointValue++; break;
+                case "currency": amended.Currency = "CAD"; break;
+                case "name": amended.Name = "Amended name"; break;
+                default: throw new ArgumentException("Unknown amendment", "changed");
+            }
+            return amended;
+        }
+        private static void AssertReconnectCommission(Harness h, Fill amended, PositionSnapshot position, decimal expected)
+        {
+            var snapshot = Fixtures.Snapshot(new[] { amended }, position);
+            var live = Assert.Single(h.Worker.Builder.Open);
+            for (int repeat = 0; repeat < 2; repeat++)
+            {
+                h.Worker.Resync(amended.Account, snapshot);
+                Assert.True(live.Sendable); Assert.Equal(expected, live.Commission);
+                var applied = live.Fills.Single(x => x.ExecId == amended.ExecId);
+                Assert.Equal(amended.Commission, applied.SourceCommission);
+                Assert.True(ExecutionEvidence.From(amended).Matches(applied.Evidence));
+                Assert.Equal(amended.Commission, Assert.Single(snapshot.Executions).Commission);
+            }
+            amended.Op = "Update"; h.Worker.Apply(amended);
+            h.Worker.Resync(amended.Account, snapshot);
+            Assert.True(live.Sendable); Assert.Equal(expected, live.Commission);
+            Assert.Equal(amended.Commission, live.Fills.Single(x => x.ExecId == amended.ExecId).SourceCommission);
         }
         [Theory]
         [InlineData(2000)]
@@ -221,6 +274,146 @@ namespace ZoneKeeper.Tests
             h.Worker.Apply(Fixtures.Fill("end", false, 1, 101, 0, .25m));
             Assert.Equal(150, Assert.Single(h.Queue.Peek(20)).Trade.PnlCents);
             Assert.DoesNotContain(h.Messages, x => x.Contains("Not sent"));
+        }
+        [Fact]
+        public async Task Case9_ReconnectCommissionAmendmentDispatchesCorrectNetBeforeDelayedUpdate()
+        {
+            using (var folder = new TestFolder())
+            {
+                var h = new Harness(); var api = new DispatchApi();
+                var session = new SessionCoordinator(Fixtures.Settings(h.Files, true), h.Queue, api, new EventLog(folder.Path));
+                h.Queue.DurableAdded += trade => session.NotifyQueued();
+                await session.ProcessAsync(Fixtures.Time, CancellationToken.None);
+                h.Worker.Apply(Fixtures.Fill("e1", true, 1, 100, 1));
+                var amended = Fixtures.Fill("e1", true, 1, 100, 1, 1);
+                var snapshot = AccountSnapshot.Capture(() => new List<PositionSnapshot> { Fixtures.Position(1) },
+                    () => new List<ExecutionEvidence> { ExecutionEvidence.From(amended) });
+                Assert.True(snapshot.Consistent); h.Worker.Resync("Sim101", snapshot);
+                h.Worker.Apply(Fixtures.Fill("exit", false, 1, 101, 0));
+                await session.ProcessAsync(Fixtures.Time, CancellationToken.None);
+                Assert.Equal(1, api.Inner.Sends); var sent = Assert.Single(api.Sent);
+                Assert.Equal(100, sent.PnlCents); Assert.Equal(100, sent.CommissionCents);
+                Assert.Empty(h.Worker.Builder.Open); Assert.Equal(0, h.Queue.Count); Assert.Empty(h.Messages);
+            }
+        }
+        [Theory]
+        [InlineData("price")]
+        [InlineData("quantity")]
+        [InlineData("side")]
+        [InlineData("time")]
+        [InlineData("instrument")]
+        [InlineData("position-after")]
+        [InlineData("point-value")]
+        [InlineData("currency")]
+        [InlineData("name")]
+        public async Task Case9_ReconnectKnownExecutionAmendmentMakesUnknownOnceAndNeverDispatches(string changed)
+        {
+            using (var folder = new TestFolder())
+            {
+                var h = new Harness(); var api = new DispatchApi();
+                var session = new SessionCoordinator(Fixtures.Settings(h.Files, true), h.Queue, api, new EventLog(folder.Path));
+                await session.ProcessAsync(Fixtures.Time, CancellationToken.None);
+                var entry = Fixtures.Fill("entry", true, 1, 100, 1); h.Worker.Apply(entry);
+                // Keep all position metadata unchanged: only the known raw execution differs.
+                var snapshot = new AccountSnapshot(new[] { Fixtures.Position(1) }, new[] { Amend(ExecutionEvidence.From(entry), changed) });
+                h.Worker.Resync("Sim101", snapshot); h.Worker.Resync("Sim101", snapshot);
+                var unknown = Assert.Single(h.Worker.Builder.Open);
+                Assert.True(unknown.UnknownStart); Assert.True(unknown.Broken); Assert.Equal(1, unknown.Net);
+                Assert.Contains("execution changed", Assert.Single(h.Messages));
+                h.Worker.Apply(Fixtures.Fill("exit", false, 1, 101, 0));
+                Assert.Empty(h.Worker.Builder.Open); Assert.Empty(h.Queue.Peek(20)); Assert.Equal(0, h.Queue.Count);
+                await session.ProcessAsync(Fixtures.Time + 300000, CancellationToken.None);
+                Assert.Equal(0, api.Inner.Sends); Assert.Empty(api.Sent); Assert.Single(h.Messages);
+            }
+        }
+        [Fact]
+        public void Case9_ReconnectPartialExitCommissionAmendmentIsIdempotentWithDelayedUpdate()
+        {
+            var h = new Harness(); h.Worker.Apply(Fixtures.Fill("entry", true, 3, 100, 3, .30m));
+            h.Worker.Apply(Fixtures.Fill("partial", false, 1, 101, 2, .20m));
+            var amended = Fixtures.Fill("partial", false, 1, 101, 2, 1.20m);
+            AssertReconnectCommission(h, amended, Fixtures.Position(2), 1.50m);
+            h.Worker.Apply(Fixtures.Fill("exit", false, 2, 102, 0, .40m));
+            var trade = Assert.Single(h.Queue.Peek(20)).Trade;
+            Assert.Equal(190, trade.CommissionCents); Assert.Equal(810, trade.PnlCents);
+            Assert.Equal("Execution correction: no affected waiting trade. Already dispatched trades cannot be changed.", Assert.Single(h.Messages));
+        }
+        [Fact]
+        public void Case9_ReconnectLiveReversalCommissionUsesOnlyRemainderAndDelayedUpdateIsIdempotent()
+        {
+            var h = new Harness(); h.Worker.Apply(Fixtures.Fill("entry", true, 2, 100, 2, .20m));
+            h.Worker.Apply(Fixtures.Fill("flip", false, 3, 110, -1, .60m));
+            var live = Assert.Single(h.Worker.Builder.Open); var applied = Assert.Single(live.Fills);
+            Assert.Equal(3, applied.SourceQty); Assert.Equal(1, applied.AppliedQty);
+            var amended = Fixtures.Fill("flip", false, 3, 110, -1, 1.50m);
+            AssertReconnectCommission(h, amended, Fixtures.Position(-1, 110), .50m);
+            h.Worker.Apply(Fixtures.Fill("exit", true, 1, 109, 0, .40m));
+            var trade = Assert.Single(h.Queue.Peek(20)).Trade;
+            Assert.Equal("exit", trade.ExitExecId); Assert.Equal(90, trade.CommissionCents); Assert.Equal(110, trade.PnlCents);
+        }
+        [Fact]
+        public void Case9_ReconnectUnknownReversalCommissionUsesOnlyRemainderAndDelayedUpdateIsIdempotent()
+        {
+            var h = new Harness(); h.Worker.Resync("Sim101", Fixtures.Snapshot(new Fill[0], Fixtures.Position(2)));
+            h.Worker.Apply(Fixtures.Fill("flip", false, 5, 110, -3, 1));
+            var live = Assert.Single(h.Worker.Builder.Open); var applied = Assert.Single(live.Fills);
+            Assert.Equal(5, applied.SourceQty); Assert.Equal(3, applied.AppliedQty);
+            var amended = Fixtures.Fill("flip", false, 5, 110, -3, 2);
+            AssertReconnectCommission(h, amended, Fixtures.Position(-3, 110), 1.20m);
+            h.Worker.Apply(Fixtures.Fill("exit", true, 3, 109, 0, .40m));
+            var trade = Assert.Single(h.Queue.Peek(20)).Trade;
+            Assert.Equal(160, trade.CommissionCents); Assert.Equal(440, trade.PnlCents);
+            Assert.Equal(2, h.Messages.Count); Assert.Contains("was open before ZoneKeeper started", h.Messages[0]);
+            Assert.Equal("Execution correction: no affected waiting trade. Already dispatched trades cannot be changed.", h.Messages[1]);
+        }
+        [Theory]
+        [InlineData("commission")]
+        [InlineData("price")]
+        [InlineData("quantity")]
+        [InlineData("side")]
+        [InlineData("time")]
+        [InlineData("instrument")]
+        [InlineData("position-after")]
+        [InlineData("point-value")]
+        [InlineData("currency")]
+        [InlineData("name")]
+        public void Case9_ReconnectInconsistentSnapshotIgnoresKnownExecutionAmendment(string changed)
+        {
+            var h = new Harness(); var entry = Fixtures.Fill("entry", true, 1, 100, 1, .25m); h.Worker.Apply(entry);
+            var live = Assert.Single(h.Worker.Builder.Open); var applied = Assert.Single(live.Fills);
+            var snapshot = new AccountSnapshot(new[] { Fixtures.Position(1) }, new[] { Amend(ExecutionEvidence.From(entry), changed) }, false);
+            h.Worker.Resync("Sim101", snapshot);
+            Assert.Same(live, Assert.Single(h.Worker.Builder.Open)); Assert.True(live.Sendable); Assert.Equal(.25m, live.Commission);
+            Assert.Equal(.25m, applied.SourceCommission); Assert.True(ExecutionEvidence.From(entry).Matches(applied.Evidence));
+            h.Worker.Apply(Fixtures.Fill("exit", false, 1, 101, 0, .25m));
+            Assert.Equal(150, Assert.Single(h.Queue.Peek(20)).Trade.PnlCents);
+            Assert.Contains("snapshot was inconsistent", Assert.Single(h.Messages));
+        }
+        [Fact]
+        public async Task Case9_ReconnectCommissionMutationKeepsDispatchExcludedThroughPersistence()
+        {
+            using (var folder = new TestFolder())
+            {
+                var h = new Harness(); var api = new DispatchApi();
+                var session = new SessionCoordinator(Fixtures.Settings(h.Files, true), h.Queue, api, new EventLog(folder.Path));
+                h.Queue.DurableAdded += trade => session.NotifyQueued();
+                await session.ProcessAsync(Fixtures.Time, CancellationToken.None);
+                Assert.True(h.Queue.Add(Fixtures.Trade("unrelated", "Sim102")));
+                h.Worker.Apply(Fixtures.Fill("entry", true, 1, 100, 1));
+                Task send = null; decimal? persistedCommission = null; decimal? persistedEvidenceCommission = null;
+                h.Files.BeforeWrite = path => {
+                    if (path != "open" || send != null) return;
+                    var live = Assert.Single(h.Worker.Builder.Open);
+                    persistedCommission = live.Commission; persistedEvidenceCommission = Assert.Single(live.Fills).Evidence.Commission;
+                    send = session.ProcessAsync(Fixtures.Time, CancellationToken.None);
+                    Assert.False(send.IsCompleted); Assert.Equal(0, api.Inner.Sends);
+                };
+                h.Worker.Resync("Sim101", Fixtures.Snapshot(new[] { Fixtures.Fill("entry", true, 1, 100, 1, 1) }, Fixtures.Position(1)));
+                h.Files.BeforeWrite = null; Assert.NotNull(send); await send;
+                Assert.Equal(1, persistedCommission); Assert.Equal(1, persistedEvidenceCommission);
+                Assert.Equal(1, api.Inner.Sends); Assert.Equal("unrelated", Assert.Single(api.Sent).ExitExecId);
+                Assert.True(Assert.Single(h.Worker.Builder.Open).Sendable);
+            }
         }
         [Theory]
         [InlineData("after")]

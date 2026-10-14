@@ -97,6 +97,18 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             if (trade.EvidenceLimitExceeded && !trade.UnknownStart)
                 MakeUnknown(trade, "Not sent: this trade exceeded the local execution-evidence limit.");
         }
+        private void ApplyCorrection(OpenTrade trade, AppliedFill applied, ExecutionEvidence corrected)
+        {
+            var comparison = corrected.Copy(); comparison.Commission = applied.SourceCommission;
+            if (applied.Evidence == null || !applied.Evidence.Matches(comparison))
+                MakeUnknown(trade, "ZoneKeeper missed a fill of this trade: an execution changed. Not sent. Add it later by CSV.");
+            else
+            {
+                // A reversal fill belongs partly to the old trade and partly to the new one.
+                trade.Commission += (corrected.Commission - applied.SourceCommission) * applied.AppliedQty / applied.SourceQty;
+                applied.SourceCommission = corrected.Commission; applied.Evidence = corrected.Copy();
+            }
+        }
         public void OnUpdate(Fill f)
         {
             var affected = open.Values.Where(x => x.Account == f.Account && x.Fills.Any(y => y != null && y.ExecId == f.ExecId)).ToList();
@@ -104,15 +116,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             foreach (var trade in affected.Where(x => !x.UnknownStart))
             {
                 var applied = trade.Fills.First(x => x != null && x.ExecId == f.ExecId);
-                var evidence = ExecutionEvidence.From(f); evidence.Commission = applied.SourceCommission;
-                if (applied.Evidence == null || !applied.Evidence.Matches(evidence))
-                    MakeUnknown(trade, "ZoneKeeper missed a fill of this trade: an execution changed. Not sent. Add it later by CSV.");
-                else
-                {
-                    // A reversal fill belongs partly to the old trade and partly to the new one.
-                    trade.Commission += (f.Commission - applied.SourceCommission) * applied.AppliedQty / applied.SourceQty;
-                    applied.SourceCommission = f.Commission; applied.Evidence = ExecutionEvidence.From(f);
-                }
+                ApplyCorrection(trade, applied, ExecutionEvidence.From(f));
             }
         }
         public void OnRemove(Fill f)
@@ -132,6 +136,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             if (!snapshot.Consistent) { log("Account snapshot was inconsistent; positions were left unchanged (" + account + ")."); return; }
             var current = snapshot.Positions.Where(x => x.Net != 0).ToDictionary(x => Helpers.PairKey(account, x.Instrument), StringComparer.Ordinal);
             var evidence = snapshot.Executions;
+            var byId = evidence.ToLookup(x => x.ExecId, StringComparer.Ordinal);
             foreach (var trade in open.Values.Where(x => x.Account == account).ToList())
             {
                 PositionSnapshot position;
@@ -151,6 +156,13 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     if (position.Net != trade.Net || position.PointValue != trade.PointValue || position.Currency != trade.Currency ||
                         !trade.PositionAveragePrice.HasValue || Math.Abs(position.AveragePrice - trade.PositionAveragePrice.Value) > tolerance || unexplained)
                         MakeUnknown(trade, "Not sent: the position or execution list changed; continuity of this trade is unknown.");
+                    foreach (var applied in trade.Fills)
+                    {
+                        if (trade.UnknownStart) break;
+                        // Missing history proves nothing; a visible amendment must agree with our raw evidence.
+                        var corrected = byId[applied.ExecId].FirstOrDefault();
+                        if (corrected != null) ApplyCorrection(trade, applied, corrected);
+                    }
                 }
                 if (trade.UnknownStart) trade.Net = position.Net;
             }
