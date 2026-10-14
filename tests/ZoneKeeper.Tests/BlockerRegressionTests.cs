@@ -28,36 +28,44 @@ namespace ZoneKeeper.Tests
             Assert.Equal(reconnect, refreshed); Assert.Equal("sell", Assert.Single(closed).ExitExecId);
         }
         [Fact]
-        public void SignedMismatchRefusesFalseReversalAndItsReplacement()
+        public void SignedMismatchMakesPositionUnknownUntilPerFillMathShowsFlat()
         {
             var builder = Builder(); builder.OnAdd(Fixtures.Fill("entry", true, 1, 100, 1));
             Assert.Empty(builder.OnAdd(Fixtures.Fill("false-flip", false, 2, 110, 1)));
             Assert.True(Assert.Single(builder.Open).Broken);
-            Assert.Empty(builder.OnAdd(Fixtures.Fill("end", true, 1, 105, 0)));
+            Assert.Empty(builder.OnAdd(Fixtures.Fill("end", false, 1, 105, 0)));
         }
         [Fact]
         public void OppositeSignedEntryDoesNotProduceASendableTrade()
         {
             var builder = Builder(); builder.OnAdd(Fixtures.Fill("entry", false, 1, 100, 1));
-            Assert.True(Assert.Single(builder.Open).Broken);
-            Assert.Empty(builder.OnAdd(Fixtures.Fill("end", true, 1, 99, 0)));
+            Assert.True(Assert.Single(builder.Open).UnknownStart);
+            Assert.Empty(builder.OnAdd(Fixtures.Fill("end", false, 1, 99, 0)));
         }
         [Theory]
         [InlineData(120)]
         [InlineData(100)]
-        public void SameSizeDisconnectedCloseAndReopenCannotResumeOldEntry(int price)
+        public void RestartNeverResumesOldEntryForSameSizePosition(int price)
         {
             var builder = Builder(); builder.OnAdd(Fixtures.Fill("entry", true, 1, 100, 1));
-            var restored = Builder(); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(builder.Open)));
+            var files = new MemoryFiles();
+            files.Data["open"] = Json.Write(new OpenTradesState { OpenTrades = builder.Open });
+            var restored = Builder();
+            new FillCoordinator(restored, new OpenTradesFile("open", files, delegate { }), new OutboxQueue("queue", files, delegate { }));
+            Assert.Empty(restored.Open); Assert.Equal(0, restored.SeenCount);
             restored.OnResync("Sim101", new[] { Long(price) }, new[] { "entry", "offline-close", "offline-open" });
             Assert.True(Assert.Single(restored.Open).UnknownStart);
             Assert.Empty(restored.OnAdd(Fixtures.Fill("end", false, 1, 125, 0)));
         }
         [Fact]
-        public void MissingExecutionHistoryCannotProveSameTrade()
+        public void RestartHasNoLiveTradeEvenWithMatchingPosition()
         {
             var builder = Builder(); builder.OnAdd(Fixtures.Fill("entry", true, 1, 100, 1));
-            var restored = Builder(); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(builder.Open)));
+            var files = new MemoryFiles();
+            files.Data["open"] = Json.Write(new OpenTradesState { OpenTrades = builder.Open });
+            var restored = Builder();
+            new FillCoordinator(restored, new OpenTradesFile("open", files, delegate { }), new OutboxQueue("queue", files, delegate { }));
+            Assert.Empty(restored.Open); Assert.Equal(0, restored.SeenCount);
             restored.OnResync("Sim101", new[] { Long() }, new string[0]);
             Assert.True(Assert.Single(restored.Open).UnknownStart);
         }

@@ -37,8 +37,9 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             {
                 if (!files.Exists(path)) return new OpenTradesState();
                 OpenTradesState state;
-                if (Json.TryRead(files.Read(path), out state) && state.Version == 1 && state.OpenTrades != null && state.PendingClosed != null)
+                if (Json.TryRead(files.Read(path), out state) && state.Version == 1 && state.PendingClosed != null)
                 {
+                    state.OpenTrades = new List<OpenTrade>();
                     state.PendingProvenance = state.PendingProvenance ?? new List<PendingProvenance>();
                     state.Invalidated = state.Invalidated ?? new List<string>();
                     foreach (var trade in state.PendingClosed)
@@ -55,6 +56,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         }
         public bool Save(OpenTradesState state)
         {
+            // Saved open trades from older versions are never resumed. Only the closed handoff survives.
+            state.OpenTrades = new List<OpenTrade>();
             try { files.Write(path, Json.Write(state)); return true; }
             catch (Exception) { log(UiText.SaveFailed); return false; }
         }

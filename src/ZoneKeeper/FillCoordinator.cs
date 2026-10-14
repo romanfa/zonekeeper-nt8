@@ -16,7 +16,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public FillCoordinator(TradeBuilder builder, OpenTradesFile file, OutboxQueue queue)
         {
             Builder = builder; openFile = file; outbox = queue;
-            var state = openFile.Load(); Builder.Restore(state.OpenTrades); pending = state.PendingClosed;
+            var state = openFile.Load(); pending = state.PendingClosed;
             outbox.ImportInvalidations(state.Invalidated, state.BlockAll);
             DropInvalidated();
         }
@@ -68,7 +68,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             dirty = !complete; return complete;
         }
         public OpenTradesState Snapshot()
-        { return new OpenTradesState { OpenTrades = Builder.Open, PendingClosed = pending.ToList(),
+        { return new OpenTradesState { OpenTrades = new List<OpenTrade>(), PendingClosed = pending.ToList(),
             PendingProvenance = pending.Select(x => new PendingProvenance { Key = x.Key, Provenance = x.Provenance }).ToList(),
             Invalidated = outbox.Invalidated, BlockAll = outbox.BlockAll }; }
     }

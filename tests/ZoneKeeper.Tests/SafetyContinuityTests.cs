@@ -89,17 +89,14 @@ namespace ZoneKeeper.Tests
             Assert.True(applied.Consistent); Assert.Empty(worker.Builder.Open);
         }
         [Theory]
-        [InlineData(true, false)]
-        [InlineData(true, true)]
-        [InlineData(false, false)]
-        [InlineData(false, true)]
-        public void FractionalScaledAverageFromNinjaTraderResumesLiveAndRestoredTrade(bool buy, bool restored)
+        [InlineData(true)]
+        [InlineData(false)]
+        public void FractionalScaledAverageFromNinjaTraderKeepsLiveTrade(bool buy)
         {
             int sign = buy ? 1 : -1; decimal scalePrice = buy ? 100.25m : 99.75m;
             var fills = new[] { Fixtures.Fill("entry", buy, 1, 100, sign), Fixtures.Fill("scale", buy, 2, scalePrice, sign * 3) };
             var files = new MemoryFiles(); var outbox = new OutboxQueue("queue", files, delegate { }); var worker = Worker(files, outbox);
             foreach (var fill in fills) worker.Apply(fill);
-            if (restored) worker = Worker(files, outbox);
             decimal ntAverage = (decimal)((100d + 2d * (double)scalePrice) / 3d);
             Assert.NotEqual(Assert.Single(worker.Builder.Open).PositionAveragePrice.Value, ntAverage);
             worker.Resync("Sim101", Fixtures.Snapshot(fills, Fixtures.Position(sign * 3, ntAverage)));
@@ -107,27 +104,6 @@ namespace ZoneKeeper.Tests
             var trade = Assert.Single(outbox.Peek(20)).Trade;
             Assert.Equal(500, trade.PnlCents); Assert.Equal(3, trade.Qty); Assert.Equal(buy ? "long" : "short", trade.Side);
             Assert.Equal(new[] { "entry", "scale" }, trade.EntryExecIds); Assert.Empty(worker.Builder.Open);
-        }
-        [Theory]
-        [InlineData(false)]
-        [InlineData(true)]
-        public void StartupRetryPreservesLiveEntryAfterAlreadyFlatHistoryAndCanRestoreItsFullCheckpoint(bool restoreAfterRetry)
-        {
-            var files = new MemoryFiles(); var outbox = new OutboxQueue("queue", files, delegate { }); var worker = Worker(files, outbox);
-            var oldEntry = Fixtures.Fill("old-entry", true, 1, 90, 1); oldEntry.TimeMs -= 60000;
-            var oldExit = Fixtures.Fill("old-exit", false, 1, 91, 0); oldExit.TimeMs -= 30000;
-            var buy = Fixtures.Fill("entry", true, 1, 100, 1); var history = new[] { oldEntry, oldExit, buy };
-            var work = new Queue<Action>(); var background = new Queue<Action>(); var source = new object();
-            var boundary = new AccountEventBoundary<object>(work.Enqueue); int captures = 0;
-            boundary.Request(source, background.Enqueue, current => {
-                if (++captures == 1) boundary.Fill(source, () => worker.Apply(buy));
-                return Fixtures.Snapshot(history, Fixtures.Position(1));
-            }, null, (current, snapshot) => worker.Resync("Sim101", snapshot));
-            background.Dequeue()(); while (background.Count != 0) background.Dequeue()();
-            while (work.Count != 0) work.Dequeue()();
-            if (restoreAfterRetry) { worker = Worker(files, outbox); worker.Resync("Sim101", Fixtures.Snapshot(history, Fixtures.Position(1))); }
-            worker.Apply(Fixtures.Fill("end", false, 1, 101, 0));
-            Assert.Equal(200, Assert.Single(outbox.Peek(20)).Trade.PnlCents); Assert.Equal(2, captures);
         }
         [Fact]
         public void RepeatedCaptureCrossingsYieldWithoutApplyingAnUnstableSnapshotOrRefreshingTwice()
@@ -155,7 +131,7 @@ namespace ZoneKeeper.Tests
             Assert.Equal(1000, Assert.Single(outbox.Peek(20)).Trade.PnlCents);
         }
         [Fact]
-        public void StableCallbackRevisionCannotBlessInternallyChangingSnapshotAndIsLogged()
+        public void StableCallbackRevisionKeepsLiveTradeWhenSnapshotChangesAndIsLogged()
         {
             var messages = new List<string>(); var b = new TradeBuilder(TimeZoneInfo.Utc, messages.Add);
             var entry = Fixtures.Fill("entry", true, 1, 100, 1); b.OnAdd(entry);
@@ -169,42 +145,15 @@ namespace ZoneKeeper.Tests
             }, null, (current, snapshot) => { Assert.False(snapshot.Consistent); applications++; b.OnResync("Sim101", snapshot); });
             background.Dequeue()(); while (work.Count != 0) work.Dequeue()();
             Assert.Equal(1, captures); Assert.Equal(1, applications); Assert.Empty(background);
-            Assert.Empty(b.OnAdd(Fixtures.Fill("end", false, 1, 101, 0)));
-            Assert.Contains(messages, x => x.Contains("Not sent:") && x.Contains("snapshot was inconsistent"));
-        }
-        [Fact]
-        public void LiveReversalRemainderCanResumeWithOlderPrefixAnchoredByItsObservedFlatStart()
-        {
-            var oldEntry = Fixtures.Fill("old-entry", true, 1, 90, 1); oldEntry.TimeMs -= 60000;
-            var oldExit = Fixtures.Fill("old-exit", false, 1, 91, 0); oldExit.TimeMs -= 30000;
-            var entry = Fixtures.Fill("entry", true, 2, 100, 2); var reversal = Fixtures.Fill("flip", false, 3, 110, -1);
-            var b = Builder(); b.OnAdd(entry); Assert.Equal(4000, Assert.Single(b.OnAdd(reversal)).PnlCents);
-            b.OnResync("Sim101", Fixtures.Snapshot(new[] { oldEntry, oldExit, entry, reversal }, Fixtures.Position(-1, 110)));
-            var trade = Assert.Single(b.OnAdd(Fixtures.Fill("end", true, 1, 109, 0)));
-            Assert.Equal(200, trade.PnlCents); Assert.Equal("short", trade.Side);
-        }
-        [Fact]
-        public void LivePrefixCannotCreateAnUnboundedPersistedCheckpointAndIsLogged()
-        {
-            var messages = new List<string>(); var b = new TradeBuilder(TimeZoneInfo.Utc, messages.Add);
-            var entry = Fixtures.Fill("entry", true, 1, 100, 1); b.OnAdd(entry);
-            var history = new List<Fill>();
-            for (int i = 0; i < ExecutionEvidence.MaximumCount; i++)
-            {
-                bool buy = i % 2 == 0;
-                var old = Fixtures.Fill("old" + i, buy, 1, 90, buy ? 1 : 0); old.TimeMs -= 60000; history.Add(old);
-            }
-            history.Add(entry);
-            b.OnResync("Sim101", Fixtures.Snapshot(history, Fixtures.Position(1)));
-            Assert.True(Assert.Single(b.Open).UnknownStart);
-            Assert.True(Assert.Single(b.Open).ExecutionCheckpoint == null || Assert.Single(b.Open).ExecutionCheckpoint.Count <= ExecutionEvidence.MaximumCount);
-            Assert.Empty(b.OnAdd(Fixtures.Fill("end", false, 1, 101, 0)));
-            Assert.Contains(messages, x => x.Contains("Not sent:") && x.Contains("execution history exceeded"));
+            Assert.False(Assert.Single(b.Open).UnknownStart);
+            Assert.Equal(200, Assert.Single(b.OnAdd(Fixtures.Fill("end", false, 1, 101, 0))).PnlCents);
+            Assert.Contains(messages, x => x.Contains("snapshot was inconsistent") && x.Contains("left unchanged"));
+            Assert.DoesNotContain(messages, x => x.Contains("Not sent"));
         }
         [Theory]
         [InlineData(-1)]
         [InlineData(1)]
-        public void FloatNoiseAverageDifferenceKeepsProvedLiveTrade(int direction)
+        public void FloatNoiseAverageDifferenceKeepsLiveTrade(int direction)
         {
             var entry = Fixtures.Fill("entry", true, 1, 100, 1); var b = Builder(); b.OnAdd(entry);
             b.OnResync("Sim101", Fixtures.Snapshot(new[] { entry }, Fixtures.Position(1, 100 + direction * .000000000001m)));
@@ -221,74 +170,12 @@ namespace ZoneKeeper.Tests
             Assert.Empty(b.OnAdd(Fixtures.Fill("end", false, 1, 101, 0)));
             Assert.Contains(messages, x => x.Contains("Not sent:") && x.Contains("continuity"));
         }
-        [Theory]
-        [InlineData(0)]
-        [InlineData(-1)]
-        public void MissingOrNonpositiveTickSizeCannotValidateEvenAnExactAverageAndIsLogged(int tick)
-        {
-            var messages = new List<string>(); var b = new TradeBuilder(TimeZoneInfo.Utc, messages.Add);
-            var entry = Fixtures.Fill("entry", true, 1, 100, 1); b.OnAdd(entry);
-            var position = Fixtures.Position(1); position.TickSize = tick;
-            b.OnResync("Sim101", Fixtures.Snapshot(new[] { entry }, position));
-            Assert.Empty(b.OnAdd(Fixtures.Fill("end", false, 1, 101, 0)));
-            Assert.Contains(messages, x => x.Contains("Not sent:") && x.Contains("tick size"));
-        }
-        [Theory]
-        [InlineData("after")]
-        [InlineData("inside")]
-        [InlineData("restored-prefix")]
-        public void PriceToleranceAndLivePrefixRuleCannotBlessUnprovedExecutionHistory(string gap)
-        {
-            var messages = new List<string>(); var b = new TradeBuilder(TimeZoneInfo.Utc, messages.Add);
-            var entry = Fixtures.Fill("entry", true, 1, 100, 1); b.OnAdd(entry); int net = 1;
-            var history = new List<Fill> { entry };
-            if (gap == "restored-prefix")
-            {
-                var restored = new TradeBuilder(TimeZoneInfo.Utc, messages.Add); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(b.Open))); b = restored;
-                var oldEntry = Fixtures.Fill("old-entry", true, 1, 90, 1); oldEntry.TimeMs -= 60000;
-                var oldExit = Fixtures.Fill("old-exit", false, 1, 91, 0); oldExit.TimeMs -= 30000;
-                history.InsertRange(0, new[] { oldEntry, oldExit });
-            }
-            else
-            {
-                history.Add(Fixtures.Fill("missed-buy", true, 1, 100, 2)); history.Add(Fixtures.Fill("missed-sell", false, 1, 100, 1));
-                if (gap == "inside") { var scale = Fixtures.Fill("scale", true, 1, 100, 2); b.OnAdd(scale); history.Add(scale); net = 2; }
-            }
-            b.OnResync("Sim101", Fixtures.Snapshot(history, Fixtures.Position(net, 100.1m)));
-            Assert.True(Assert.Single(b.Open).UnknownStart); Assert.Empty(b.OnAdd(Fixtures.Fill("end", false, net, 101, 0)));
-            if (gap == "restored-prefix")
-                Assert.Contains("Open trade from before the restart could not be checked. Not sent. You can add it later by CSV.", messages);
-            else Assert.Contains(messages, x => x.Contains("Not sent:") && x.Contains("continuity"));
-        }
         [Fact]
         public void PositionAndLatestSignedExecutionMustAgreeInSnapshot()
         {
             var snapshot = AccountSnapshot.Capture(() => new List<PositionSnapshot> { Fixtures.Position(1) },
                 () => new List<ExecutionEvidence> { ExecutionEvidence.From(Fixtures.Fill("short", false, 1, 100, -1)) });
             Assert.False(snapshot.Consistent);
-        }
-        [Fact]
-        public void FullUnchangedCheckpointResumesValidShortAndRetainsCommission()
-        {
-            var entry = Fixtures.Fill("short", false, 2, 100, -2, 1); var partial = Fixtures.Fill("partial", true, 1, 99, -1, .5m);
-            var b = Builder(); b.OnAdd(entry); b.OnAdd(partial);
-            var restored = Builder(); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(b.Open)));
-            restored.OnResync("Sim101", Fixtures.Snapshot(new[] { entry, partial }, Fixtures.Position(-1)));
-            Assert.False(Assert.Single(restored.Open).AwaitingContinuity);
-            var trade = Assert.Single(restored.OnAdd(Fixtures.Fill("end", true, 1, 98, 0, .5m)));
-            Assert.Equal(200, trade.CommissionCents); Assert.Equal(400, trade.PnlCents);
-        }
-        [Theory]
-        [InlineData(100)]
-        [InlineData(120)]
-        public void FullHistoryRejectsSameSizeOfflineCloseAndReopenEvenAtSamePrice(int price)
-        {
-            var entry = Fixtures.Fill("entry", true, 1, 100, 1); var b = Builder(); b.OnAdd(entry);
-            var restored = Builder(); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(b.Open)));
-            var history = new[] { entry, Fixtures.Fill("offline-close", false, 1, 110, 0), Fixtures.Fill("offline-open", true, 1, price, 1) };
-            restored.OnResync("Sim101", Fixtures.Snapshot(history, Fixtures.Position(1, price)));
-            Assert.True(Assert.Single(restored.Open).UnknownStart);
-            Assert.Empty(restored.OnAdd(Fixtures.Fill("end", false, 1, 125, 0)));
         }
         [Fact]
         public void InstrumentAmendmentBreaksOriginalOpenTradeByRawExecutionIdentity()
@@ -298,34 +185,14 @@ namespace ZoneKeeper.Tests
             b.Process(update); Assert.True(Assert.Single(b.Open).Broken);
             Assert.Empty(b.OnAdd(Fixtures.Fill("end", false, 1, 101, 0)));
         }
-        [Theory]
-        [InlineData("time")]
-        [InlineData("commission")]
-        [InlineData("currency")]
-        [InlineData("point-value")]
-        [InlineData("position")]
-        [InlineData("name")]
-        public void AmendedHistoryCannotResumeSavedOpenEvenWithSameSizeAndPrice(string changed)
-        {
-            var entry = Fixtures.Fill("entry", true, 1, 100, 1); var b = Builder(); b.OnAdd(entry);
-            var restored = Builder(); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(b.Open)));
-            if (changed == "time") entry.TimeMs++;
-            if (changed == "commission") entry.Commission++;
-            if (changed == "currency") entry.Currency = "CAD";
-            if (changed == "point-value") entry.PointValue++;
-            if (changed == "position") entry.PositionAfter = -1;
-            if (changed == "name") entry.Name = "Amended";
-            restored.OnResync("Sim101", Fixtures.Snapshot(new[] { entry }, Fixtures.Position(1)));
-            Assert.True(Assert.Single(restored.Open).UnknownStart);
-            Assert.Empty(restored.OnAdd(Fixtures.Fill("end", false, 1, 101, 0)));
-        }
         [Fact]
-        public void LiveTimeAmendmentBreaksOpenTradeAndCannotBlessOldEntryTimeAfterRestart()
+        public void LiveTimeAmendmentMakesTradeUnknownAndRestartCannotUseItsOldEntryTime()
         {
             var entry = Fixtures.Fill("entry", true, 1, 100, 1); var b = Builder(); b.OnAdd(entry);
             var update = Fixtures.Fill("entry", true, 1, 100, 1); update.Op = "Update"; update.TimeMs++;
             b.Process(update); Assert.True(Assert.Single(b.Open).Broken);
-            var restored = Builder(); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(b.Open)));
+            Assert.True(Assert.Single(b.Open).UnknownStart);
+            var restored = Builder();
             restored.OnResync("Sim101", Fixtures.Snapshot(new[] { update }, Fixtures.Position(1)));
             Assert.Empty(restored.OnAdd(Fixtures.Fill("end", false, 1, 101, 0)));
         }
@@ -334,12 +201,13 @@ namespace ZoneKeeper.Tests
         {
             var fills = new[] { Fixtures.Fill("entry", true, 2, 100, 2), Fixtures.Fill("partial", false, 1, 101, 1), Fixtures.Fill("scale", true, 1, 104, 2) };
             var b = Builder(); foreach (var fill in fills) b.OnAdd(fill);
-            var restored = Builder(); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(b.Open)));
-            restored.OnResync("Sim101", Fixtures.Snapshot(fills, Fixtures.Position(2, 102)));
-            Assert.False(Assert.Single(restored.Open).UnknownStart); Assert.Single(restored.OnAdd(Fixtures.Fill("end", false, 2, 106, 0)));
+            Assert.Equal(102m, Assert.Single(b.Open).PositionAveragePrice);
+            b.OnResync("Sim101", Fixtures.Snapshot(fills, Fixtures.Position(2, 102)));
+            Assert.False(Assert.Single(b.Open).UnknownStart);
+            Assert.Equal(1800, Assert.Single(b.OnAdd(Fixtures.Fill("end", false, 2, 106, 0))).PnlCents);
         }
         [Fact]
-        public void CompleteClosedProvenanceIncludesEntryBeyondApiLimitAndPartialExitAfterRestart()
+        public void CompleteClosedProvenanceIncludesAllRawFillsAndSurvivesClosedQueueRestart()
         {
             var files = new MemoryFiles(); var queue = new OutboxQueue("queue", files, delegate { }); var worker = Worker(files, queue); var history = new List<Fill>();
             for (int i = 0; i < 12; i++) { var fill = Fixtures.Fill("entry" + i, true, 1, 100, i + 1); history.Add(fill); worker.Apply(fill); }

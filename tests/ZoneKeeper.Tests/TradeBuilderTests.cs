@@ -86,24 +86,27 @@ namespace ZoneKeeper.Tests
             Assert.Empty(b.Open);
         }
         [Fact]
-        public void T11_CommissionUpdateReplacesAmountAndSurvivesRestart()
+        public void T11_CommissionUpdateReplacesAmountWhileLiveAndRestartRestoresNothing()
         {
             var b = Builder(); b.OnAdd(Fixtures.Fill("a", true, 1, 100, 1, .1m));
-            var restored = Builder(); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(b.Open)));
-            restored.OnResync("Sim101", Fixtures.Snapshot(new[] { Fixtures.Fill("a", true, 1, 100, 1, .1m) }, Fixtures.Position(1)));
             var update = Fixtures.Fill("a", true, 1, 100, 1, .7m); update.Op = "Update";
-            restored.Process(update); restored.Process(update);
-            var trade = Assert.Single(restored.OnAdd(Fixtures.Fill("b", false, 1, 101, 0, .3m)));
+            b.Process(update); b.Process(update);
+            var files = new MemoryFiles(); files.Data["open"] = Json.Write(new OpenTradesState { OpenTrades = b.Open });
+            var restarted = Builder();
+            new FillCoordinator(restarted, new OpenTradesFile("open", files, delegate { }), new OutboxQueue("queue", files, delegate { }));
+            Assert.Empty(restarted.Open); Assert.Equal(0, restarted.SeenCount);
+            restarted.OnResync("Sim101", Fixtures.Snapshot(new[] { update }, Fixtures.Position(1)));
+            Assert.Empty(restarted.OnAdd(Fixtures.Fill("b", false, 1, 101, 0, .3m)));
+            var trade = Assert.Single(b.OnAdd(Fixtures.Fill("b", false, 1, 101, 0, .3m)));
             Assert.Equal(100, trade.CommissionCents); Assert.Equal(100, trade.PnlCents);
         }
         [Fact]
         public void LateReversalCommissionUsesOnlyItsRemainingFraction()
         {
             var b = Builder(); b.OnAdd(Fixtures.Fill("a", true, 2, 100, 2)); b.OnAdd(Fixtures.Fill("flip", false, 3, 110, -1, 3));
-            var restored = Builder(); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(b.Open)));
-            restored.OnResync("Sim101", Fixtures.Snapshot(new[] { Fixtures.Fill("a", true, 2, 100, 2), Fixtures.Fill("flip", false, 3, 110, -1, 3) }, Fixtures.Position(-1, 110)));
-            var update = Fixtures.Fill("flip", false, 3, 110, -1, 6); update.Op = "Update"; restored.Process(update);
-            var trade = Assert.Single(restored.OnAdd(Fixtures.Fill("end", true, 1, 109, 0)));
+            b.OnResync("Sim101", Fixtures.Snapshot(new[] { Fixtures.Fill("a", true, 2, 100, 2), Fixtures.Fill("flip", false, 3, 110, -1, 3) }, Fixtures.Position(-1, 110)));
+            var update = Fixtures.Fill("flip", false, 3, 110, -1, 6); update.Op = "Update"; b.Process(update);
+            var trade = Assert.Single(b.OnAdd(Fixtures.Fill("end", true, 1, 109, 0)));
             Assert.Equal(200, trade.CommissionCents); Assert.Equal(0, trade.PnlCents);
         }
         [Theory]
@@ -134,17 +137,16 @@ namespace ZoneKeeper.Tests
             Assert.Equal(200, trade.PnlCents); Assert.Empty(b.Open);
         }
         [Fact]
-        public void T15_ResyncChecksSignedSizeAndSeedsOldExecutions()
+        public void T15_ResyncChecksSignedSizeWithoutRestoringOrSeedingExecutions()
         {
-            var old = Fixtures.Fill("old", false, 1, 101, 0); old.TimeMs -= 1000000;
-            var b = Builder(); b.OnResync("Sim101", Fixtures.Snapshot(new[] { old })); b.OnAdd(Fixtures.Fill("a", true, 1, 100, 1));
-            var restored = Builder(); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(b.Open)));
-            restored.OnResync("Sim101", Fixtures.Snapshot(new[] { old, Fixtures.Fill("a", true, 1, 100, 1) }, Fixtures.Position(1)));
-            Assert.False(Assert.Single(restored.Open).UnknownStart);
-            Assert.Empty(restored.OnAdd(Fixtures.Fill("old", false, 1, 101, 0)));
-            Assert.Single(restored.OnAdd(Fixtures.Fill("b", false, 1, 101, 0)));
+            var old = Fixtures.Fill("old", true, 1, 100, 1);
+            var b = Builder(); b.OnResync("Sim101", Fixtures.Snapshot(new[] { old }));
+            Assert.Equal(0, b.SeenCount); b.OnAdd(old);
+            Assert.False(Assert.Single(b.Open).UnknownStart);
+            Assert.Single(b.OnAdd(Fixtures.Fill("b", false, 1, 101, 0)));
+            b.OnAdd(Fixtures.Fill("new", true, 1, 100, 1));
             b.OnResync("Sim101", new[] { new PositionSnapshot { Instrument = "MNQ 12-26", Net = -1, PointValue = 2, Currency = "USD" } }, new string[0]);
-            Assert.True(Assert.Single(b.Open).UnknownStart);
+            Assert.True(Assert.Single(b.Open).UnknownStart); Assert.Equal(-1, Assert.Single(b.Open).Net);
             Assert.Empty(b.OnAdd(Fixtures.Fill("close", true, 1, 99, 0))); Assert.Empty(b.Open);
         }
         [Fact]
@@ -199,7 +201,8 @@ namespace ZoneKeeper.Tests
         public void T19_OldFillsSkippedExceptPlayback(bool playback)
         {
             var b = Builder(); var a = Fixtures.Fill("a", true, 1, 100, 1); a.ArrivedMs = a.TimeMs + 900001; a.IsPlayback = playback;
-            b.OnAdd(a); Assert.Equal(playback ? 1 : 0, b.Open.Count);
+            b.OnAdd(a);
+            var trade = Assert.Single(b.Open); Assert.Equal(!playback, trade.UnknownStart); Assert.Equal(playback, trade.Sendable);
         }
         [Fact]
         public void SeenSetKeepsLast5000AndAccountIdentityIsUnambiguous()
@@ -216,18 +219,24 @@ namespace ZoneKeeper.Tests
         [InlineData("close")]
         public void T21_PositionMismatchNeverSends(string where)
         {
-            var b = Builder(); b.OnAdd(Fixtures.Fill("a", true, 2, 100, where == "start" ? 1 : 2));
+            var b = Builder(); b.OnAdd(Fixtures.Fill("a", true, 2, 100, where == "start" ? 3 : 2));
             if (where == "scale-in") b.OnAdd(Fixtures.Fill("b", true, 1, 100, 2));
             if (where == "scale-out") b.OnAdd(Fixtures.Fill("b", false, 1, 101, 2));
             int own = Math.Abs(Assert.Single(b.Open).Net);
             Assert.Empty(b.OnAdd(Fixtures.Fill("end", false, own, 101, where == "close" ? 1 : 0)));
+            if (where == "close")
+            {
+                Assert.True(Assert.Single(b.Open).UnknownStart);
+                Assert.Empty(b.OnAdd(Fixtures.Fill("flat", false, 1, 101, 0)));
+            }
             Assert.Empty(b.Open);
         }
         [Fact]
-        public void T21_BrokenTradeDropsOnNtFlatEvenWhenOurSizeIsNotFlat()
+        public void T21_UnknownPositionEndsOnNtFlatThenNextTradeIsSent()
         {
-            var b = Builder(); b.OnAdd(Fixtures.Fill("a", true, 3, 100, 1));
-            Assert.Empty(b.OnAdd(Fixtures.Fill("b", false, 1, 101, 0))); Assert.Empty(b.Open);
+            var b = Builder(); b.OnAdd(Fixtures.Fill("a", true, 3, 100, 4));
+            Assert.True(Assert.Single(b.Open).UnknownStart);
+            Assert.Empty(b.OnAdd(Fixtures.Fill("b", false, 4, 101, 0))); Assert.Empty(b.Open);
             b.OnAdd(Fixtures.Fill("c", true, 1, 100, 1)); Assert.Single(b.OnAdd(Fixtures.Fill("d", false, 1, 101, 0)));
         }
         [Fact]

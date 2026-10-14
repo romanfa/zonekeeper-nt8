@@ -88,15 +88,17 @@ namespace ZoneKeeper.Tests
             files.FailWrites = null; Assert.True(worker.RetryPersistence()); Assert.Single(q.Peek(20)); Assert.Empty(file.Load().PendingClosed);
         }
         [Fact]
-        public void T15_AtomicOpenStateRetainsAllFillContributions()
+        public void T15_AtomicFileWritesNoOpenStateAndIgnoresLegacyFillContributions()
         {
             using (var folder = new TestFolder())
             {
                 var file = new OpenTradesFile(Path.Combine(folder.Path, "open-trades.json"), new AtomicFileStore(), delegate { });
                 var b = new TradeBuilder(TimeZoneInfo.Utc, delegate { }); b.OnAdd(Fixtures.Fill("a", true, 2, 100, 2, 1));
                 b.OnAdd(Fixtures.Fill("b", false, 1, 101, 1, .5m));
+                File.WriteAllText(Path.Combine(folder.Path, "open-trades.json"), Json.Write(new OpenTradesState { OpenTrades = b.Open }));
+                Assert.Empty(file.Load().OpenTrades);
                 Assert.True(file.Save(new OpenTradesState { OpenTrades = b.Open }));
-                var restored = Assert.Single(file.Load().OpenTrades); Assert.Equal(2, restored.Fills.Count); Assert.Equal(1.5m, restored.Commission);
+                Assert.Empty(Json.Read<OpenTradesState>(File.ReadAllText(Path.Combine(folder.Path, "open-trades.json"))).OpenTrades);
                 Assert.False(File.Exists(Path.Combine(folder.Path, "open-trades.json.tmp")));
                 b.OnReset("Sim101"); Assert.True(file.Save(new OpenTradesState { OpenTrades = b.Open })); Assert.Empty(file.Load().OpenTrades);
             }
