@@ -164,6 +164,22 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         {
             foreach (var key in open.Where(x => x.Value.Account == account).Select(x => x.Key).ToList()) open.Remove(key);
         }
+        private static bool CheckpointMatches(OpenTrade trade, List<ExecutionEvidence> actual)
+        {
+            var expected = trade.ExecutionCheckpoint;
+            if (expected == null || expected.Count == 0 || expected.Count > ExecutionEvidence.MaximumCount ||
+                actual.Count > ExecutionEvidence.MaximumCount || expected.Any(x => x == null || !x.Complete)) return false;
+            int prefix = actual.Count - expected.Count;
+            if (prefix < 0) return false;
+            if (prefix != 0)
+            {
+                // Only a fully observed live checkpoint starting from flat can own older leading history.
+                // A restored/unknown/broken trade still needs the entire unchanged checkpoint.
+                var first = expected[0];
+                if (!trade.Sendable || first.PositionAfter != (first.IsBuy ? first.Qty : -first.Qty)) return false;
+            }
+            return expected.Zip(actual.Skip(prefix), (x, y) => x.Matches(y)).All(x => x);
+        }
         public void OnResync(string account, IEnumerable<PositionSnapshot> positions, IEnumerable<string> executionIds)
         {
             OnResync(account, new AccountSnapshot(positions, executionIds.Select(id => new ExecutionEvidence { ExecId = id })));
@@ -171,18 +187,24 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public void OnResync(string account, AccountSnapshot snapshot)
         {
             var positions = snapshot.Positions; var evidence = snapshot.Executions;
+            if (!snapshot.Consistent) log("Not sent: account snapshot was inconsistent; execution continuity could not be proved (" + account + ").");
             if (snapshot.Consistent) foreach (var x in evidence) if (!string.IsNullOrEmpty(x.ExecId)) Remember(account, x.ExecId);
             var current = positions.Where(x => x.Net != 0).ToDictionary(x => Helpers.PairKey(account, x.Instrument), StringComparer.Ordinal);
+            foreach (var p in current.Values.Where(x => x.TickSize <= 0))
+                log("Not sent: instrument tick size is missing or nonpositive (" + account + " · " + p.Instrument + ").");
             foreach (var t in open.Values.Where(x => x.Account == account).ToList())
             {
                 PositionSnapshot p;
-                var expected = t.ExecutionCheckpoint;
                 var actual = evidence.Where(x => x.Instrument == t.Instrument).ToList();
-                bool continuous = snapshot.Consistent && expected != null && expected.Count > 0 && expected.Count <= ExecutionEvidence.MaximumCount &&
-                    actual.Count == expected.Count && expected.Zip(actual, (x, y) => x != null && x.Complete && x.Matches(y)).All(x => x);
+                if (actual.Count > ExecutionEvidence.MaximumCount)
+                    log("Not sent: execution history exceeded the local evidence limit (" + account + " · " + t.Instrument + ").");
+                bool continuous = snapshot.Consistent && CheckpointMatches(t, actual);
                 if (current.TryGetValue(t.Key, out p) && p.Net == t.Net && t.PositionAveragePrice.HasValue &&
-                    p.AveragePrice == t.PositionAveragePrice.Value && p.PointValue == t.PointValue && p.Currency == t.Currency && continuous)
+                    p.TickSize > 0 && Math.Abs(p.AveragePrice - t.PositionAveragePrice.Value) <= p.TickSize / 2m &&
+                    p.PointValue == t.PointValue && p.Currency == t.Currency && continuous)
                 {
+                    // Adopt proved leading history, so a later restart still uses exact full-history equality.
+                    t.ExecutionCheckpoint = actual.Select(x => x.Copy()).ToList();
                     t.AwaitingContinuity = false;
                     log("Resumed an open trade: " + account + " · " + t.Instrument + " · " + (t.IsLong ? "long " : "short ") + Math.Abs(t.Net) + ".");
                 }

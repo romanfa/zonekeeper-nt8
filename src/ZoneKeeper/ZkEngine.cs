@@ -165,7 +165,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 }), CaptureAccount, beforeApply, (source, snapshot) => {
                     if (!settings.IsEnabled(source.Name) || watcher == null || !watcher.IsCurrent(source)) return;
                     fills.Resync(source.Name, snapshot);
-                });
+                }, message => log.Write(message + " (" + account.Name + ")."));
             }
             private AccountSnapshot CaptureAccount(Account account)
             {
@@ -177,7 +177,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                         {
                             if (p.Instrument == null || p.MarketPosition == MarketPosition.Flat || p.Quantity == 0) continue;
                             positions.Add(new PositionSnapshot { Instrument = p.Instrument.FullName, Net = p.MarketPosition == MarketPosition.Long ? Math.Abs(p.Quantity) : -Math.Abs(p.Quantity),
-                                AveragePrice = (decimal)p.AveragePrice, PointValue = (decimal)p.Instrument.MasterInstrument.PointValue,
+                                AveragePrice = (decimal)p.AveragePrice, TickSize = (decimal)p.Instrument.MasterInstrument.TickSize,
+                                PointValue = (decimal)p.Instrument.MasterInstrument.PointValue,
                                 Currency = Helpers.CurrencyIso(p.Instrument.MasterInstrument.Currency.ToString()) });
                         }
                     }

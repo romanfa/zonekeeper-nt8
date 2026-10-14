@@ -285,6 +285,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public string Instrument { get; set; }
         public int Net { get; set; }
         public decimal AveragePrice { get; set; }
+        public decimal TickSize { get; set; }
         public decimal PointValue { get; set; }
         public string Currency { get; set; }
     }

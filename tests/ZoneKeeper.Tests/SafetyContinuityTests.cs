@@ -50,9 +50,10 @@ namespace ZoneKeeper.Tests
         {
             var position = Fixtures.Position(1); var evidence = ExecutionEvidence.From(Fixtures.Fill("entry", true, 1, 100, 1));
             var snapshot = new AccountSnapshot(new[] { position }, new[] { evidence });
-            position.Net = -5; evidence.Commission = 10;
-            snapshot.Positions[0].Net = 99; snapshot.Executions[0].Price = 999;
+            position.Net = -5; position.TickSize = 10; evidence.Commission = 10;
+            snapshot.Positions[0].Net = 99; snapshot.Positions[0].TickSize = 20; snapshot.Executions[0].Price = 999;
             Assert.Equal(1, snapshot.Positions[0].Net); Assert.Equal(100, snapshot.Executions[0].Price); Assert.Equal(0, snapshot.Executions[0].Commission);
+            Assert.Equal(.25m, snapshot.Positions[0].TickSize);
         }
         [Fact]
         public void HistoryChangingDuringPositionCaptureDoesNotSeedUncertainExecutions()
@@ -64,19 +65,198 @@ namespace ZoneKeeper.Tests
             var b = Builder(); b.OnResync("Sim101", snapshot);
             b.OnAdd(buy); Assert.Single(b.OnAdd(sell));
         }
-        [Fact]
-        public void CallbackDuringBackgroundCaptureInvalidatesItsCutoffWithoutSeedingItAway()
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void CallbackDuringBackgroundCaptureRetriesAndSendsObservedTradeOnce(bool reconnect)
         {
-            var b = Builder(); var work = new Queue<Action>(); var background = new Queue<Action>(); var source = new object();
+            var files = new MemoryFiles(); var outbox = new OutboxQueue("queue", files, delegate { }); var worker = Worker(files, outbox);
+            var work = new Queue<Action>(); var background = new Queue<Action>(); var source = new object();
             var boundary = new AccountEventBoundary<object>(work.Enqueue); var buy = Fixtures.Fill("buy", true, 1, 100, 1);
-            AccountSnapshot applied = null;
+            AccountSnapshot applied = null; int captures = 0; int applications = 0; int refreshes = 0;
             boundary.Request(source, background.Enqueue, current => {
-                boundary.Fill(source, () => b.OnAdd(buy));
+                Assert.Same(source, current);
+                if (++captures == 1) boundary.Fill(source, () => worker.Apply(buy));
                 return Fixtures.Snapshot(new[] { buy }, Fixtures.Position(1));
-            }, null, (current, snapshot) => { applied = snapshot; b.OnResync("Sim101", snapshot); });
+            }, reconnect ? (Action)(() => refreshes++) : null,
+                (current, snapshot) => { applications++; applied = snapshot; worker.Resync("Sim101", snapshot); });
+            background.Dequeue()(); while (background.Count != 0) background.Dequeue()();
+            while (work.Count != 0) work.Dequeue()();
+            var exit = Fixtures.Fill("end", false, 1, 101, 0); worker.Apply(exit); worker.Apply(exit);
+            var trade = Assert.Single(outbox.Peek(20)).Trade;
+            Assert.Equal(200, trade.PnlCents); Assert.Equal("end", trade.ExitExecId);
+            Assert.Equal(2, captures); Assert.Equal(1, applications); Assert.Equal(reconnect ? 1 : 0, refreshes);
+            Assert.True(applied.Consistent); Assert.Empty(worker.Builder.Open);
+        }
+        [Theory]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        public void FractionalScaledAverageFromNinjaTraderResumesLiveAndRestoredTrade(bool buy, bool restored)
+        {
+            int sign = buy ? 1 : -1; decimal scalePrice = buy ? 100.25m : 99.75m;
+            var fills = new[] { Fixtures.Fill("entry", buy, 1, 100, sign), Fixtures.Fill("scale", buy, 2, scalePrice, sign * 3) };
+            var files = new MemoryFiles(); var outbox = new OutboxQueue("queue", files, delegate { }); var worker = Worker(files, outbox);
+            foreach (var fill in fills) worker.Apply(fill);
+            if (restored) worker = Worker(files, outbox);
+            decimal ntAverage = (decimal)((100d + 2d * (double)scalePrice) / 3d);
+            Assert.NotEqual(Assert.Single(worker.Builder.Open).PositionAveragePrice.Value, ntAverage);
+            worker.Resync("Sim101", Fixtures.Snapshot(fills, Fixtures.Position(sign * 3, ntAverage)));
+            var exit = Fixtures.Fill("end", !buy, 3, buy ? 101 : 99, 0); worker.Apply(exit); worker.Apply(exit);
+            var trade = Assert.Single(outbox.Peek(20)).Trade;
+            Assert.Equal(500, trade.PnlCents); Assert.Equal(3, trade.Qty); Assert.Equal(buy ? "long" : "short", trade.Side);
+            Assert.Equal(new[] { "entry", "scale" }, trade.EntryExecIds); Assert.Empty(worker.Builder.Open);
+        }
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void StartupRetryPreservesLiveEntryAfterAlreadyFlatHistoryAndCanRestoreItsFullCheckpoint(bool restoreAfterRetry)
+        {
+            var files = new MemoryFiles(); var outbox = new OutboxQueue("queue", files, delegate { }); var worker = Worker(files, outbox);
+            var oldEntry = Fixtures.Fill("old-entry", true, 1, 90, 1); oldEntry.TimeMs -= 60000;
+            var oldExit = Fixtures.Fill("old-exit", false, 1, 91, 0); oldExit.TimeMs -= 30000;
+            var buy = Fixtures.Fill("entry", true, 1, 100, 1); var history = new[] { oldEntry, oldExit, buy };
+            var work = new Queue<Action>(); var background = new Queue<Action>(); var source = new object();
+            var boundary = new AccountEventBoundary<object>(work.Enqueue); int captures = 0;
+            boundary.Request(source, background.Enqueue, current => {
+                if (++captures == 1) boundary.Fill(source, () => worker.Apply(buy));
+                return Fixtures.Snapshot(history, Fixtures.Position(1));
+            }, null, (current, snapshot) => worker.Resync("Sim101", snapshot));
+            background.Dequeue()(); while (background.Count != 0) background.Dequeue()();
+            while (work.Count != 0) work.Dequeue()();
+            if (restoreAfterRetry) { worker = Worker(files, outbox); worker.Resync("Sim101", Fixtures.Snapshot(history, Fixtures.Position(1))); }
+            worker.Apply(Fixtures.Fill("end", false, 1, 101, 0));
+            Assert.Equal(200, Assert.Single(outbox.Peek(20)).Trade.PnlCents); Assert.Equal(2, captures);
+        }
+        [Fact]
+        public void RepeatedCaptureCrossingsYieldWithoutApplyingAnUnstableSnapshotOrRefreshingTwice()
+        {
+            var files = new MemoryFiles(); var outbox = new OutboxQueue("queue", files, delegate { }); var worker = Worker(files, outbox);
+            var work = new Queue<Action>(); var background = new Queue<Action>(); var source = new object();
+            var boundary = new AccountEventBoundary<object>(work.Enqueue); var fills = new List<Fill>(); var messages = new List<string>();
+            int captures = 0; int applications = 0; int refreshes = 0;
+            boundary.Request(source, background.Enqueue, current => {
+                if (++captures <= 5)
+                {
+                    var fill = Fixtures.Fill("entry" + captures, true, 1, 100, captures); fills.Add(fill);
+                    boundary.Fill(source, () => worker.Apply(fill));
+                }
+                return Fixtures.Snapshot(fills, Fixtures.Position(fills.Count));
+            }, () => refreshes++, (current, snapshot) => { Assert.True(snapshot.Consistent); applications++; worker.Resync("Sim101", snapshot); }, messages.Add);
+            background.Dequeue()();
+            Assert.Equal(3, captures); Assert.Equal(0, applications); Assert.Equal(0, refreshes); Assert.Single(background);
+            while (work.Count != 0) work.Dequeue()();
+            Assert.False(Assert.Single(worker.Builder.Open).UnknownStart); Assert.Equal(3, Assert.Single(worker.Builder.Open).Net);
             background.Dequeue()(); while (work.Count != 0) work.Dequeue()();
-            Assert.False(applied.Consistent); Assert.True(Assert.Single(b.Open).UnknownStart);
+            Assert.Equal(6, captures); Assert.Equal(1, applications); Assert.Equal(1, refreshes); Assert.Empty(background);
+            Assert.Equal(5, messages.Count); Assert.All(messages, x => Assert.Contains("retrying", x));
+            worker.Apply(Fixtures.Fill("end", false, 5, 101, 0));
+            Assert.Equal(1000, Assert.Single(outbox.Peek(20)).Trade.PnlCents);
+        }
+        [Fact]
+        public void StableCallbackRevisionCannotBlessInternallyChangingSnapshotAndIsLogged()
+        {
+            var messages = new List<string>(); var b = new TradeBuilder(TimeZoneInfo.Utc, messages.Add);
+            var entry = Fixtures.Fill("entry", true, 1, 100, 1); b.OnAdd(entry);
+            var updated = Fixtures.Fill("entry", true, 1, 100, 1, 1);
+            var work = new Queue<Action>(); var background = new Queue<Action>(); var source = new object();
+            var boundary = new AccountEventBoundary<object>(work.Enqueue); int captures = 0; int reads = 0; int applications = 0;
+            boundary.Request(source, background.Enqueue, current => {
+                captures++;
+                return AccountSnapshot.Capture(() => new List<PositionSnapshot> { Fixtures.Position(1) },
+                    () => new List<ExecutionEvidence> { ExecutionEvidence.From(++reads == 1 ? entry : updated) });
+            }, null, (current, snapshot) => { Assert.False(snapshot.Consistent); applications++; b.OnResync("Sim101", snapshot); });
+            background.Dequeue()(); while (work.Count != 0) work.Dequeue()();
+            Assert.Equal(1, captures); Assert.Equal(1, applications); Assert.Empty(background);
             Assert.Empty(b.OnAdd(Fixtures.Fill("end", false, 1, 101, 0)));
+            Assert.Contains(messages, x => x.Contains("Not sent:") && x.Contains("snapshot was inconsistent"));
+        }
+        [Fact]
+        public void LiveReversalRemainderCanResumeWithOlderPrefixAnchoredByItsObservedFlatStart()
+        {
+            var oldEntry = Fixtures.Fill("old-entry", true, 1, 90, 1); oldEntry.TimeMs -= 60000;
+            var oldExit = Fixtures.Fill("old-exit", false, 1, 91, 0); oldExit.TimeMs -= 30000;
+            var entry = Fixtures.Fill("entry", true, 2, 100, 2); var reversal = Fixtures.Fill("flip", false, 3, 110, -1);
+            var b = Builder(); b.OnAdd(entry); Assert.Equal(4000, Assert.Single(b.OnAdd(reversal)).PnlCents);
+            b.OnResync("Sim101", Fixtures.Snapshot(new[] { oldEntry, oldExit, entry, reversal }, Fixtures.Position(-1, 110)));
+            var trade = Assert.Single(b.OnAdd(Fixtures.Fill("end", true, 1, 109, 0)));
+            Assert.Equal(200, trade.PnlCents); Assert.Equal("short", trade.Side);
+        }
+        [Fact]
+        public void LivePrefixCannotCreateAnUnboundedPersistedCheckpointAndIsLogged()
+        {
+            var messages = new List<string>(); var b = new TradeBuilder(TimeZoneInfo.Utc, messages.Add);
+            var entry = Fixtures.Fill("entry", true, 1, 100, 1); b.OnAdd(entry);
+            var history = new List<Fill>();
+            for (int i = 0; i < ExecutionEvidence.MaximumCount; i++)
+            {
+                bool buy = i % 2 == 0;
+                var old = Fixtures.Fill("old" + i, buy, 1, 90, buy ? 1 : 0); old.TimeMs -= 60000; history.Add(old);
+            }
+            history.Add(entry);
+            b.OnResync("Sim101", Fixtures.Snapshot(history, Fixtures.Position(1)));
+            Assert.True(Assert.Single(b.Open).UnknownStart);
+            Assert.True(Assert.Single(b.Open).ExecutionCheckpoint == null || Assert.Single(b.Open).ExecutionCheckpoint.Count <= ExecutionEvidence.MaximumCount);
+            Assert.Empty(b.OnAdd(Fixtures.Fill("end", false, 1, 101, 0)));
+            Assert.Contains(messages, x => x.Contains("Not sent:") && x.Contains("execution history exceeded"));
+        }
+        [Theory]
+        [InlineData(-1)]
+        [InlineData(1)]
+        public void HalfTickAverageDifferenceKeepsProvedLiveTrade(int direction)
+        {
+            var entry = Fixtures.Fill("entry", true, 1, 100, 1); var b = Builder(); b.OnAdd(entry);
+            b.OnResync("Sim101", Fixtures.Snapshot(new[] { entry }, Fixtures.Position(1, 100 + direction * .125m)));
+            Assert.Equal(200, Assert.Single(b.OnAdd(Fixtures.Fill("end", false, 1, 101, 0))).PnlCents);
+        }
+        [Theory]
+        [InlineData(-1)]
+        [InlineData(1)]
+        public void AverageBeyondHalfTickIsWithheldAndLogged(int direction)
+        {
+            var messages = new List<string>(); var b = new TradeBuilder(TimeZoneInfo.Utc, messages.Add);
+            var entry = Fixtures.Fill("entry", true, 1, 100, 1); b.OnAdd(entry);
+            b.OnResync("Sim101", Fixtures.Snapshot(new[] { entry }, Fixtures.Position(1, 100 + direction * .1250001m)));
+            Assert.Empty(b.OnAdd(Fixtures.Fill("end", false, 1, 101, 0)));
+            Assert.Contains(messages, x => x.Contains("Not sent:") && x.Contains("continuity"));
+        }
+        [Theory]
+        [InlineData(0)]
+        [InlineData(-1)]
+        public void MissingOrNonpositiveTickSizeCannotValidateEvenAnExactAverageAndIsLogged(int tick)
+        {
+            var messages = new List<string>(); var b = new TradeBuilder(TimeZoneInfo.Utc, messages.Add);
+            var entry = Fixtures.Fill("entry", true, 1, 100, 1); b.OnAdd(entry);
+            var position = Fixtures.Position(1); position.TickSize = tick;
+            b.OnResync("Sim101", Fixtures.Snapshot(new[] { entry }, position));
+            Assert.Empty(b.OnAdd(Fixtures.Fill("end", false, 1, 101, 0)));
+            Assert.Contains(messages, x => x.Contains("Not sent:") && x.Contains("tick size"));
+        }
+        [Theory]
+        [InlineData("after")]
+        [InlineData("inside")]
+        [InlineData("restored-prefix")]
+        public void PriceToleranceAndLivePrefixRuleCannotBlessUnprovedExecutionHistory(string gap)
+        {
+            var messages = new List<string>(); var b = new TradeBuilder(TimeZoneInfo.Utc, messages.Add);
+            var entry = Fixtures.Fill("entry", true, 1, 100, 1); b.OnAdd(entry); int net = 1;
+            var history = new List<Fill> { entry };
+            if (gap == "restored-prefix")
+            {
+                var restored = new TradeBuilder(TimeZoneInfo.Utc, messages.Add); restored.Restore(Json.Read<List<OpenTrade>>(Json.Write(b.Open))); b = restored;
+                var oldEntry = Fixtures.Fill("old-entry", true, 1, 90, 1); oldEntry.TimeMs -= 60000;
+                var oldExit = Fixtures.Fill("old-exit", false, 1, 91, 0); oldExit.TimeMs -= 30000;
+                history.InsertRange(0, new[] { oldEntry, oldExit });
+            }
+            else
+            {
+                history.Add(Fixtures.Fill("missed-buy", true, 1, 100, 2)); history.Add(Fixtures.Fill("missed-sell", false, 1, 100, 1));
+                if (gap == "inside") { var scale = Fixtures.Fill("scale", true, 1, 100, 2); b.OnAdd(scale); history.Add(scale); net = 2; }
+            }
+            b.OnResync("Sim101", Fixtures.Snapshot(history, Fixtures.Position(net, 100.1m)));
+            Assert.True(Assert.Single(b.Open).UnknownStart); Assert.Empty(b.OnAdd(Fixtures.Fill("end", false, net, 101, 0)));
+            Assert.Contains(messages, x => x.Contains("Not sent:") && x.Contains("continuity"));
         }
         [Fact]
         public void PositionAndLatestSignedExecutionMustAgreeInSnapshot()

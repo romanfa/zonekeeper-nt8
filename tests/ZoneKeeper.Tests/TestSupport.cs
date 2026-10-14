@@ -101,7 +101,7 @@ namespace ZoneKeeper.Tests
         public static AccountSnapshot Snapshot(IEnumerable<Fill> fills, params PositionSnapshot[] positions)
         { return new AccountSnapshot(positions, fills.Select(ExecutionEvidence.From)); }
         public static PositionSnapshot Position(int net, decimal price = 100)
-        { return new PositionSnapshot { Instrument = "MNQ 12-26", Net = net, AveragePrice = price, PointValue = 2, Currency = "USD" }; }
+        { return new PositionSnapshot { Instrument = "MNQ 12-26", Net = net, AveragePrice = price, TickSize = .25m, PointValue = 2, Currency = "USD" }; }
         public static void VerifyPersisted(OutboxQueue queue, MemoryFiles files, string path = "queue")
         {
             foreach (var account in files.Read(path).Split('\n').Where(x => !string.IsNullOrWhiteSpace(x)).Select(Json.Read<OutboxLine>)

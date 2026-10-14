@@ -20,7 +20,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             Consistent = consistent;
         }
         private static PositionSnapshot CopyPosition(PositionSnapshot p)
-        { return new PositionSnapshot { Instrument = p.Instrument, Net = p.Net, AveragePrice = p.AveragePrice, PointValue = p.PointValue, Currency = p.Currency }; }
+        { return new PositionSnapshot { Instrument = p.Instrument, Net = p.Net, AveragePrice = p.AveragePrice, TickSize = p.TickSize, PointValue = p.PointValue, Currency = p.Currency }; }
         public AccountSnapshot Uncertain() { return new AccountSnapshot(positions, executions, false); }
         public static AccountSnapshot Capture(Func<List<PositionSnapshot>> readPositions, Func<List<ExecutionEvidence>> readExecutions)
         {
@@ -64,20 +64,28 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             lock (gate) { revisions[source] = Revision(source) + 1; enqueue(apply); }
         }
         public void Request(T source, Action<Action> background, Func<T, AccountSnapshot> capture, Action beforeApply,
-            Action<T, AccountSnapshot> apply)
+            Action<T, AccountSnapshot> apply, Action<string> retryLog = null)
         {
             background(() => {
-                long started; lock (gate) started = Revision(source);
-                var snapshot = capture(source);
-                lock (gate)
+                // Retry callback crossings without discarding a trade the queued callbacks fully observed.
+                // Collection capture and logging stay outside the callback queue's monitor.
+                for (int attempt = 0; attempt < 3; attempt++)
                 {
-                    long cutoff = Revision(source);
-                    if (cutoff != started) snapshot = snapshot.Uncertain();
-                    ResyncBoundary.Enqueue(source, enqueue, ignored => snapshot, beforeApply, (current, captured) => {
-                        // Callbacks queued before capture are ahead of this apply; later callbacks are behind it.
-                        apply(current, captured);
-                    });
+                    long started; lock (gate) started = Revision(source);
+                    var snapshot = capture(source);
+                    lock (gate)
+                    {
+                        if (Revision(source) == started)
+                        {
+                            // Earlier callbacks are ahead of this single apply; later callbacks are behind it.
+                            ResyncBoundary.Enqueue(source, enqueue, ignored => snapshot, beforeApply, apply);
+                            return;
+                        }
+                    }
+                    if (retryLog != null) retryLog("Resync capture crossed an account callback; retrying before applying a snapshot.");
                 }
+                // Yield after bounded work. The engine's background wrapper checks stop before each turn.
+                Request(source, background, capture, beforeApply, apply, retryLog);
             });
         }
     }
