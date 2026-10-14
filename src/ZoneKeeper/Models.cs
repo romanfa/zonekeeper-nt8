@@ -164,10 +164,12 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         [DataMember] public List<ExecutionEvidence> ExecutionCheckpoint { get; set; }
         [DataMember] public decimal? PositionAveragePrice { get; set; }
         [DataMember] public bool EvidenceLimitExceeded { get; set; }
+        // A rejected restored trade stays quarantined across restarts until current position is observed flat.
+        [DataMember] public bool AwaitingFlat { get; set; }
         // A restored entry must be proved by a current snapshot before it can close safely.
         public bool AwaitingContinuity { get; set; }
         public string Key { get { return Helpers.PairKey(Account, Instrument); } }
-        public bool Sendable { get { return !UnknownStart && !Broken && !AwaitingContinuity && !EvidenceLimitExceeded && Helpers.CurrencyIso(Currency) != null; } }
+        public bool Sendable { get { return !UnknownStart && !Broken && !AwaitingContinuity && !AwaitingFlat && !EvidenceLimitExceeded && Helpers.CurrencyIso(Currency) != null; } }
 
         public static OpenTrade Start(Fill fill, int quantity, decimal commission)
         {

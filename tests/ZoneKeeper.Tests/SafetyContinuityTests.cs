@@ -204,20 +204,20 @@ namespace ZoneKeeper.Tests
         [Theory]
         [InlineData(-1)]
         [InlineData(1)]
-        public void HalfTickAverageDifferenceKeepsProvedLiveTrade(int direction)
+        public void FloatNoiseAverageDifferenceKeepsProvedLiveTrade(int direction)
         {
             var entry = Fixtures.Fill("entry", true, 1, 100, 1); var b = Builder(); b.OnAdd(entry);
-            b.OnResync("Sim101", Fixtures.Snapshot(new[] { entry }, Fixtures.Position(1, 100 + direction * .125m)));
+            b.OnResync("Sim101", Fixtures.Snapshot(new[] { entry }, Fixtures.Position(1, 100 + direction * .000000000001m)));
             Assert.Equal(200, Assert.Single(b.OnAdd(Fixtures.Fill("end", false, 1, 101, 0))).PnlCents);
         }
         [Theory]
         [InlineData(-1)]
         [InlineData(1)]
-        public void AverageBeyondHalfTickIsWithheldAndLogged(int direction)
+        public void AverageBeyondFloatNoiseToleranceIsWithheldAndLogged(int direction)
         {
             var messages = new List<string>(); var b = new TradeBuilder(TimeZoneInfo.Utc, messages.Add);
             var entry = Fixtures.Fill("entry", true, 1, 100, 1); b.OnAdd(entry);
-            b.OnResync("Sim101", Fixtures.Snapshot(new[] { entry }, Fixtures.Position(1, 100 + direction * .1250001m)));
+            b.OnResync("Sim101", Fixtures.Snapshot(new[] { entry }, Fixtures.Position(1, 100 + direction * .0002500001m)));
             Assert.Empty(b.OnAdd(Fixtures.Fill("end", false, 1, 101, 0)));
             Assert.Contains(messages, x => x.Contains("Not sent:") && x.Contains("continuity"));
         }
@@ -256,7 +256,9 @@ namespace ZoneKeeper.Tests
             }
             b.OnResync("Sim101", Fixtures.Snapshot(history, Fixtures.Position(net, 100.1m)));
             Assert.True(Assert.Single(b.Open).UnknownStart); Assert.Empty(b.OnAdd(Fixtures.Fill("end", false, net, 101, 0)));
-            Assert.Contains(messages, x => x.Contains("Not sent:") && x.Contains("continuity"));
+            if (gap == "restored-prefix")
+                Assert.Contains("Open trade from before the restart could not be checked. Not sent. You can add it later by CSV.", messages);
+            else Assert.Contains(messages, x => x.Contains("Not sent:") && x.Contains("continuity"));
         }
         [Fact]
         public void PositionAndLatestSignedExecutionMustAgreeInSnapshot()
