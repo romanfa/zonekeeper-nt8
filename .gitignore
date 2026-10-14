@@ -1,0 +1,8 @@
+bin/
+obj/
+.vs/
+*.user
+dist/
+TestResults/
+*.log
+.DS_Store
