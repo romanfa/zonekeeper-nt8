@@ -4,13 +4,13 @@ The free ZoneKeeper add-on sends closed trades from NinjaTrader 8 to your ZoneKe
 
 Works with NinjaTrader 8 (8.1 or newer) on Windows. A ZoneKeeper subscription with access is needed to connect. Not made by or tied to NinjaTrader. Source is under the [MIT license](LICENSE).
 
-**Development status:** Version 0.1.0 source was written on the Mac. NinjaTrader compilation, runtime, ZIP export, clean installation and updates are unverified on this Mac. No release ZIP has been built yet. The GitHub repository is private.
+**Development status:** Main `3b3404e` compiled and was tested on Windows on 2026-10-15 with NinjaTrader 8.1.8.3. The release 0.1.0 compiled ZIP is built. Clean installation and updates remain unverified. The GitHub repository is private.
 
 ## Install the release ZIP
 
-These are the intended member steps. Confirm the exact Import menu text and installation on Windows before publishing a release.
+The Import menu text below is confirmed on NinjaTrader 8.1.8.3. Clean installation remains unverified.
 
-1. Download the add-on. You get a `.zip` file. **Do not unzip it.** The intended download address is `https://getzonekeeper.com/downloads/ZoneKeeper-NT8.zip`; it is not published by this repository yet.
+1. Download the add-on. You get a `.zip` file. **Do not unzip it.** Download: [ZoneKeeper-NT8.zip](https://getzonekeeper.com/downloads/ZoneKeeper-NT8.zip).
 2. In NinjaTrader: Control Center → Tools → Import → NinjaScript Add-On… → pick the `.zip` file. Then restart NinjaTrader.
 3. In NinjaTrader: Control Center → New → ZoneKeeper. The ZoneKeeper window opens.
 4. On [getzonekeeper.com](https://getzonekeeper.com): Cabinet → Platforms → NinjaTrader 8 → Connect NinjaTrader. Copy the code, paste it in the ZoneKeeper window, and click Connect. It works for 10 minutes, one time.
@@ -48,7 +48,7 @@ See the [ZoneKeeper privacy policy](https://getzonekeeper.com/privacy/).
 
 ## Test on Windows
 
-Roman owns all NinjaTrader actions and Sim101 orders. Use **only `https://getzonekeeper.com`** for this handoff; do not use the preview worker. Keep `base_url` unset or set to the live address. Playback remains blocked even if `allow_playback` is true. None of the following Windows checks has been completed on this Mac.
+Roman owns all NinjaTrader actions and Sim101 orders. Use **only `https://getzonekeeper.com`** for this handoff; do not use the preview worker. Keep `base_url` unset or set to the live address. Playback remains blocked even if `allow_playback` is true. The confirmed Windows results are recorded below; other checks remain unverified.
 
 1. **First trading check on Sim101, with `debug_fills: true`, after installing and compiling the add-on below:** from flat, sell 1 MNQ, buy 2, then sell 1. The log's `position=` must read **-1, +1, 0**: signed and after the fill. Then buy 1@X and 2@X+0.25; account.Positions AveragePrice must be the unrounded **X+0.1666…**. If either check fails, change only the `before` math or the floating-point tolerance. Turn debug logging off after the check.
 
@@ -61,7 +61,7 @@ Roman owns all NinjaTrader actions and Sim101 orders. Use **only `https://getzon
    ```
 
 4. **Close NinjaTrader.** Run `& .\tools\link-dev.ps1`. **Start NinjaTrader again.** The script refuses to run while NinjaTrader is open. It creates a junction from the Windows Documents folder's `NinjaTrader 8\bin\Custom\AddOns\ZoneKeeper` to `C:\dev\zonekeeper-nt8\src\ZoneKeeper`. Confirm the files appear in NinjaScript Editor → AddOns → ZoneKeeper. If a folder already exists there, stop and inspect it before proceeding.
-5. In NinjaScript Editor → right-click → References, check `System.Net.Http`, `System.Security` and `System.Runtime.Serialization`. Add missing references from `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\`.
+5. In NinjaScript Editor → right-click → References, check `System.Net.Http`, `System.Security` and `System.Runtime.Serialization`. Add missing references from `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\` before the first F5 compile. If `NinjaTrader.Custom.dll` is not rebuilt, the references are missing; the trace may have no compile lines.
 6. Run the pure tests and read the last 30 log lines:
 
    ```powershell
@@ -69,23 +69,23 @@ Roman owns all NinjaTrader actions and Sim101 orders. Use **only `https://getzon
    Get-Content "$env:TEMP\zk-test.log" -Tail 30
    ```
 
-7. Complete the installed API checks in [docs/nt-api-notes.md](docs/nt-api-notes.md). Press **F5 in NinjaScript Editor** to compile. Visual Studio is for editing and debugging; do not build this add-on in Visual Studio. Require no ZoneKeeper compile errors or warnings.
+7. Complete the installed API checks in [docs/nt-api-notes.md](docs/nt-api-notes.md). Only after the references in step 5 are present, press **F5 in NinjaScript Editor** to compile. Visual Studio is for editing and debugging; do not build this add-on in Visual Studio. Require no ZoneKeeper compile errors or warnings.
 8. Open Control Center → New → ZoneKeeper. Get a code on the live Cabinet → Platforms → NinjaTrader 8, paste it into the add-on and click Connect. Confirm the PC and add-on version appear in the cabinet. Do not put codes or keys in logs or screenshots.
-9. On **Sim101**, close **two trades** after connection (for example, buy 1/sell 1, then sell 1/buy 1). Check the add-on log and cabinet for both, once each.
+9. On **Sim101**, close **two trades** after connection (for example, buy 1/sell 1, then sell 1/buy 1). Check the add-on log and `/api/trades` for both, once each. Cabinet → Journal trade rows are Phase C and are expected to be absent for now.
 10. While logged in to the live site, open `/api/trades?from=YYYY-MM-DD&to=YYYY-MM-DD` with today's date in both places. Compare the two trades' account, side, quantity, prices, net P/L, commission, times and exit name with NinjaTrader's executions. Zero commission is valid if Sim101 has no commission template.
 
 ## Windows acceptance checklist
 
-All items are **unverified** until Roman records results. Use live + Sim101 throughout. This replaces the older plan's preview instructions. Fake HTTP tests cover error paths without changing live billing or account records.
+G0, G1 and G5 have the limited **PASSED 2026-10-15** results below. All other checks remain **unverified** until Roman records results. Use live + Sim101 throughout. This replaces the older plan's preview instructions. Fake HTTP tests cover error paths without changing live billing or account records.
 
 | Check | Owner action and expected result |
 | --- | --- |
-| G0 Setup/API | Verify installed signatures, Active startup and single engine. Check account replacement/resync uses the current account object and stale queued events cannot alter its state. Temporarily enable `debug_fills` with NinjaTrader closed. Buy 1/sell 1 on Sim101 MNQ: Add operation, position 1 then 0, UTC time within 2 seconds of the PC clock, USD and point value 2. Turn debug logging off afterward. |
-| G1 Scale-in | Buy 1, buy 1, sell 2: one long trade, quantity 2, weighted entry price and net P/L. |
+| G0 Setup/API | **PASSED 2026-10-15:** main `3b3404e` compiled on NT 8.1.8.3; signed positions after fills were -1, +1, 0. |
+| G1 Scale-in | **PASSED 2026-10-15:** buy 1 + buy 2 produced quantity 3 with unrounded average 7770.58333333333. |
 | G2 Partial exit | Buy 2, sell 1, sell 1: one trade, weighted exit price; final sell's execution ID closes it. |
 | G3 Flip | Buy 1, sell 2 in one fill, buy 1: one long and one short trade; split the reversal commission. |
 | G4 Breakeven | Use an ATM stop at entry: gross zero, net P/L equals negative commission, exit name recorded. |
-| G5 Compare | Compare G1–G4 with NinjaTrader Executions CSV and logged-in live `/api/trades`, to the cent. Roman may set a Sim101 commission template to check nonzero commission. |
+| G5 Compare | **PASSED 2026-10-15:** six Sim101 ES 12-26 trades sent once each matched NinjaTrader Executions and live `/api/trades` to the cent, including 2.88/side commission. |
 | G6 Offline/disconnect | Roman interrupts the network, closes a Sim101 trade, then reconnects: queued trade sends once. Roman disconnects this PC in the cabinet, then reconnects with a new code: 401 clears the old key and waiting trades send. Check add-on Disconnect also frees the device slot. |
 | G7 Restart | Roman ends NinjaTrader mid-trade and restarts: never resume the open trade; its close sends nothing and the next trade opened from flat sends once. Repeat with stale execution history and a second restart. Also restart after an offline closed trade and verify one delivery when its fill history remains available. Normal shutdown drains queued fills for the final current account objects and saves pending closed state; events from replaced objects must not alter it. |
 | G8 Lapsed plan | Fake tests cover `403 not_paid`, paused queue and retry. **No agent changes live account or billing data.** Roman may verify live behavior if a naturally lapsed account is available; otherwise record the live check as deferred. |
@@ -99,14 +99,16 @@ All items are **unverified** until Roman records results. Use live + Sim101 thro
 
 ## Export and release
 
-Do this on Windows after compilation, tests, fresh code review and acceptance checks. The ZIP has not been built or checked yet.
+The release 0.1.0 compiled ZIP was built and checked on Windows on 2026-10-15. For later exports, use the steps below after compilation, tests, fresh code review and acceptance checks.
 
 1. Keep `VERSION`, `ZkVersion.Value` and the changelog version at `0.1.0`. Turn NinjaScript Editor Debug Mode off and press F5.
-2. Control Center → Tools → Export → NinjaScript… → **Export as compiled assembly**. Leave **Protect compiled assembly** unchecked. Select **all** source files under AddOns → ZoneKeeper; compare the export list with `src\ZoneKeeper\*.cs`.
+2. Control Center → Tools → Export → NinjaScript… → **Export as compiled assembly**. Leave **Protect compiled assembly** unchecked. Select **all** source files under AddOns → ZoneKeeper; compare the export list with `src\ZoneKeeper\*.cs`. The export file name must be exactly **`ZoneKeeper`** (confirmed on Windows).
 3. Set Product `ZoneKeeper`, Version `0.1.0`, and export file name **`ZoneKeeper`**. Keep this name for every version so updates do not load a second assembly.
-4. Inspect `Documents\NinjaTrader 8\bin\Custom\ExportNinjaScript\ZoneKeeper.zip`: require one `ZoneKeeper.dll` plus NinjaTrader's info file, and no `.cs` files.
+4. Inspect `Documents\NinjaTrader 8\bin\Custom\ExportNinjaScript\ZoneKeeper.zip`: require one `ZoneKeeper.dll`, `Info.xml`, and the small NT-generated `ZoneKeeper.cs` stub (1143 bytes, no real source code).
 5. Copy the same bytes to `dist\ZoneKeeper-NT8-0.1.0.zip` and `dist\ZoneKeeper-NT8.zip`. Run `tools\checksum.ps1`; confirm both hashes in `dist\SHA256SUMS.txt` match.
 6. Complete G12 and G13 before release. For the clean install, **close NinjaTrader → run `tools/unlink-dev.ps1` → start NinjaTrader again** before importing the ZIP; follow G12 for restoring the development junction. Making the repository public, tagging/publishing a release and hosting the ZIP on the site remain separate coordinator/owner actions. This documentation does not publish or change the site.
+
+The final 0.1.0 ZIP is 224013 bytes; SHA256 `702d472f160d86040dc0ed4e462bfc1f9df5b9b4327c2452dbbfa139a772bc8c`. `ZoneKeeper.dll` is 755200 bytes. The same ZIP is available at [the live download address](https://getzonekeeper.com/downloads/ZoneKeeper-NT8.zip).
 
 ## Update
 

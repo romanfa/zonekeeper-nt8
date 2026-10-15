@@ -1,6 +1,6 @@
 # NinjaTrader API notes
 
-Checked against official NinjaTrader help pages and the official Basic sample on 2026-10-14. This is source evidence, **not** an installed NinjaTrader compile or runtime result. This Mac has not verified the Windows assemblies, event ordering, lifecycle, UI dispatch or export/import behavior.
+Checked against official NinjaTrader help pages and the official Basic sample on 2026-10-14. That section records source evidence. The Windows checklist below records the limited checks confirmed on 2026-10-15; the remaining installed API, lifecycle, UI dispatch, import and update checks are still unverified.
 
 The Phase B handoff uses **only `https://getzonekeeper.com`**, with Roman placing Sim101 orders. The older plans' preview instructions do not apply. Playback uploads stay blocked on live, including when `allow_playback` is enabled. G9 runtime replay upload testing is blocked; pure tests cover parsing.
 
@@ -34,6 +34,16 @@ Sample imports: `NinjaTrader.Cbi`, `NinjaTrader.Data`, `NinjaTrader.Gui.Tools`, 
 
 ## Windows Object Browser and runtime checklist
 
+Confirmed on Windows 2026-10-15 with NinjaTrader 8.1.8.3, main `3b3404e`:
+
+- [x] `Execution.Position` is signed and after the fill: sell 1, buy 2, sell 1 gave -1, +1, 0.
+- [x] Account `AveragePrice` is unrounded: buy 1@7771.25 + buy 2@7770.25 gave 7770.58333333333.
+- [x] References `System.Net.Http`, `System.Runtime.Serialization` and `System.Security` are needed before F5; adding the last two let `NinjaTrader.Custom.dll` rebuild.
+- [x] Compiled export contains `Info.xml`, `ZoneKeeper.dll` and the NT-generated `ZoneKeeper.cs` stub (1143 bytes, no real source code).
+- [x] Import menu: Control Center → Tools → Import → NinjaScript Add-On….
+
+Still unverified unless noted above:
+
 Use NinjaScript Editor's Visual Studio button, then View → Object Browser. Record the NinjaTrader version, assembly versions, actual type names and answers below. Do not build the add-on in Visual Studio.
 
 - [ ] Base type `NinjaTrader.NinjaScript.AddOnBase`, `NinjaTrader.Gui.Tools.NTWindow`, `NinjaTrader.Gui.ControlCenter`, and the installed namespaces for Account, Execution, Position, MasterInstrument, Provider, Currency and both event-args types.
@@ -43,14 +53,14 @@ Use NinjaScript Editor's Visual Studio button, then View → Object Browser. Rec
 - [ ] `Currency`: confirm `UsDollar`, and the expected `CanadianDollar`, `Euro`, `BritishPound`, `AustralianDollar`, `SwissFranc`, `NewZealandDollar`. Fix the string map if actual names differ; unknown currencies must not be sent.
 - [ ] `Core.Globals.UserDataDir`: member type and actual folder, including redirected Documents. No current help-guide member page was found in this bounded search. The plan's cited forum URL returned 404, so this member remains unverified here. Use `Path.Combine`.
 - [ ] `Core.Globals.GeneralOptions.TimeZoneInfo`: installed member/type; compare Tools → Options zone with actual fill timestamps. Convert an Unspecified fill DateTime through the NinjaTrader zone to UTC; verify the local fallback and DST behavior.
-- [ ] `Execution.Position`: long/short sign and whether it is before or after the fill. Record entry, scale-in, partial exit, flat close and reversal values. Pairing and snapshot checks require signed quantity after the fill, including the reversal remainder; a mismatch withholds both sides. This assumption remains unverified on Windows. Do not normalize to absolute quantity without installed evidence.
+- [ ] `Execution.Position`: record additional entry, scale-in and partial-exit values beyond the signed reversal/flat check above. Pairing and snapshot checks require signed quantity after the fill, including the reversal remainder; a mismatch withholds both sides. Do not normalize to absolute quantity.
 - [ ] `Execution.MarketPosition`: confirm fill buy/sell direction for long entries/exits, short entries/exits and reversals. Confirm null Order handling, commission update behavior and account denomination.
 - [ ] `State.Active`: engine starts once; compile-created copies do not start duplicate workers; Terminated unsubscribes and disposes. G15 recompile must keep one engine and one trade delivery. Verify owner-aware start/stop prevents an old instance from stopping or replacing the newer pending engine.
 - [ ] Account replacement and shutdown drain: fills, reset and resync use captured Account objects and reject stale replaced objects at worker execution. G0 checks reconnect/replacement; G7/G15 check shutdown drains queued work against frozen final account identities and saves the result without accepting replaced-account events.
 - [ ] Dispatcher APIs and thread behavior: callbacks/events, window opening via RandomDispatcher, UI updates through the window Dispatcher, closing/reopening and recompiling with a window open. Activating the existing single window must run on that window's owning Dispatcher.
 - [ ] Startup file access: distinguish actual Windows sharing/lock failures from other I/O/access failures. Verify sharing errors retry before OtherInstance, other file/access failures retry without claiming another engine owns the lock, and normal shutdown releases it.
 - [ ] Direct Grid NTWindow with public default constructor; one window only; no workspace persistence required for this settings panel. G14 must prove restart/save has no errors and engine keeps working.
-- [ ] Exact import/export/remove menu names; F5 compiler accepts C# 7.3 source and required framework references. Export/import, clean installation and same-name assembly update remain unverified until G12/G13.
+- [ ] Exact remove menu name, import behavior, clean installation and same-name assembly update remain unverified until G12/G13. F5 compilation and compiled export passed; Import menu text is confirmed above.
 
 ## Final server contract used by Phase B
 
@@ -81,4 +91,4 @@ Additional static source decisions from the builder's handoff:
 
 These are source decisions, not Windows pass results. G0 account replacement and G7/G15 shutdown, queued-fill drain, dispatcher and recompile behavior remain unverified until Roman tests them on Windows.
 
-No test count or Windows pass claim is recorded here. Pure test results belong in the coordinator's final report; Windows G0–G15 results must be recorded separately, with G8 live lapse deferred unless naturally available, G9 blocked for live uploads, and G11 optional.
+The limited Windows pass results are recorded above. Pure test results belong in the coordinator's final report; remaining Windows G0–G15 checks must be recorded separately, with G8 live lapse deferred unless naturally available, G9 blocked for live uploads, and G11 optional.

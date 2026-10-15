@@ -1,8 +1,13 @@
 # Changelog
 
+## Planned for 0.1.1
+
+- Label the sample connect code `Example: ZK-AB3D-9KXP`.
+- Show the saved account hint: `Saved. You can close this window.`
+
 ## 0.1.0 — first version
 
-Unreleased. NinjaTrader compilation, runtime, compiled ZIP installation and updates still need Windows verification.
+Released 2026-10-15. ZIP SHA256 702d472f160d86040dc0ed4e462bfc1f9df5b9b4327c2452dbbfa139a772bc8c
 
 - Fix: ZkEngine.ReportError could not read Run.log (CS0122 on NinjaTrader compile)
 - Connect a PC with a one-time ZoneKeeper code; keep its key protected with Windows DPAPI.
