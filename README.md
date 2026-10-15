@@ -4,7 +4,7 @@ The free ZoneKeeper add-on sends closed trades from NinjaTrader 8 to your ZoneKe
 
 Works with NinjaTrader 8 (8.1 or newer) on Windows. A ZoneKeeper subscription with access is needed to connect. Not made by or tied to NinjaTrader. Source is under the [MIT license](LICENSE).
 
-**Development status:** Main `3b3404e` compiled and was tested on Windows on 2026-10-15 with NinjaTrader 8.1.8.3. The release 0.1.0 compiled ZIP is built. Clean installation and updates remain unverified. The GitHub repository is private.
+**Development status:** Main `3b3404e` compiled and was tested on Windows on 2026-10-15 with NinjaTrader 8.1.8.3. The release 0.1.0 compiled ZIP is built. Clean installation and updates remain unverified. The GitHub repository is public since 2026-10-15 (read the code; install with the ZIP).
 
 ## Install the release ZIP
 
