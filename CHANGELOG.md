@@ -4,6 +4,7 @@
 
 Unreleased. NinjaTrader compilation, runtime, compiled ZIP installation and updates still need Windows verification.
 
+- Fix: ZkEngine.ReportError could not read Run.log (CS0122 on NinjaTrader compile)
 - Connect a PC with a one-time ZoneKeeper code; keep its key protected with Windows DPAPI.
 - Pair fills into closed trades, including scale-ins, partial exits and reversals; send net P/L, commission and the final exit order name.
 - Select accounts; block Playback uploads on the live site.

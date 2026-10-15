@@ -94,7 +94,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             private readonly SemaphoreSlim wake = new SemaphoreSlim(0, 1);
             private readonly CancellationTokenSource cancel = new CancellationTokenSource();
             private readonly object accountsGate = new object();
-            private readonly EventLog log;
+            internal readonly EventLog log;
             private readonly string folder;
             private FileStream runningLock;
             private Task lifetime;
