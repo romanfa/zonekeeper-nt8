@@ -25,6 +25,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private readonly ListBox events = new ListBox { MinHeight = 120, MaxHeight = 200 };
         private readonly Button retry = MakeButton("Try again now");
         private readonly Button disconnect = MakeButton("Disconnect this PC");
+        private readonly Button resets = MakeButton("Reopen pending resets");
         private bool closed;
         private bool connecting;
         public ZoneKeeperWindow()
@@ -46,7 +47,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 try { Process.Start(new ProcessStartInfo("https://getzonekeeper.com/app/#platforms") { UseShellExecute = true }); }
                 catch (Exception ex) { message.Text = "Could not open your browser. Open getzonekeeper.com."; ZkEngine.ReportError("Could not open your browser", ex); }
             };
-            content.Children.Add(open); content.Children.Add(disconnect);
+            content.Children.Add(open); content.Children.Add(resets); content.Children.Add(disconnect);
+            resets.Click += delegate { ZkEngine.ReopenResets(); };
             Content = new ScrollViewer { Content = content, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
             connect.Click += async delegate {
                 if (connecting) return;
@@ -97,6 +99,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private void Render()
         {
             var snapshot = ZkEngine.Snapshot(); var s = snapshot.Session;
+            resets.Content = "Reopen pending resets (" + snapshot.PendingResets + ")";
+            resets.IsEnabled = s.Status == ZkStatus.Connected;
             status.Text = UiText.Status(s.Status, s.EmailMasked, s.NextTryMs);
             info.Text = "Waiting to send: " + s.Waiting + " trades" + (s.LastSentMs == 0 ? "" : " · Last sent: " + DateTimeOffset.FromUnixTimeMilliseconds(s.LastSentMs).ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture));
             clock.Text = UiText.ClockWarning(s.ClockOffsetMs); clock.Visibility = clock.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;

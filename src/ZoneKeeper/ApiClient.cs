@@ -16,7 +16,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         Task<ApiResult> SendTradesAsync(string token, List<TradeRecord> trades, CancellationToken cancellation);
         Task<ApiResult> DisconnectAsync(string token, CancellationToken cancellation);
     }
-    public sealed class ApiClient : IAddonApi
+    public sealed class ApiClient : IAddonApi, IResetApi
     {
         private readonly HttpClient client;
         private readonly Action<string> protectSecret;
@@ -52,7 +52,11 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public Task<ApiResult> PingAsync(string token, CancellationToken cancellation)
         { return CallAsync<PingAnswer>(HttpMethod.Get, "/api/nt/ping", token, null, cancellation); }
         public Task<ApiResult> SendTradesAsync(string token, List<TradeRecord> trades, CancellationToken cancellation)
-        { return CallAsync<TradesAnswer>(HttpMethod.Post, "/api/nt/trades", token, Json.Write(new TradesBody { Trades = trades }), cancellation); }
+        { return CallAsync<TradesAnswer>(HttpMethod.Post, "/api/nt/trades", token, Json.Write(new TradesBody { Trades = trades, AutoReset = true }), cancellation); }
+        public Task<ApiResult> GetResetsAsync(string token, long after, CancellationToken cancellation)
+        { return CallAsync<ResetsAnswer>(HttpMethod.Get, "/api/nt/resets?after=" + after.ToString(System.Globalization.CultureInfo.InvariantCulture), token, null, cancellation); }
+        public Task<ApiResult> OpenResetAsync(string token, long tradeId, CancellationToken cancellation)
+        { return CallAsync<ResetOpenAnswer>(HttpMethod.Post, "/api/nt/resets/open", token, Json.Write(new ResetOpenBody { TradeId = tradeId }), cancellation); }
         public Task<ApiResult> DisconnectAsync(string token, CancellationToken cancellation)
         { return CallAsync<DisconnectAnswer>(HttpMethod.Post, "/api/nt/disconnect", token, null, cancellation); }
         private async Task<ApiResult> CallAsync<T>(HttpMethod method, string path, string token, string body, CancellationToken cancellation)

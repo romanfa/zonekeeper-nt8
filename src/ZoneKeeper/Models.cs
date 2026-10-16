@@ -319,6 +319,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
     }
     [DataContract] public sealed class TradesBody
     {
+        [DataMember(Name = "auto_reset")] public bool AutoReset { get; set; }
         [DataMember(Name = "trades")] public List<TradeRecord> Trades { get; set; }
     }
     [DataContract] public sealed class ErrorAnswer

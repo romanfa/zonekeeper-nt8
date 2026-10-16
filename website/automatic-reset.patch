@@ -1,0 +1,1678 @@
+diff --git a/migrations/0017_automatic_resets.sql b/migrations/0017_automatic_resets.sql
+new file mode 100644
+index 0000000..c1bdc4e
+--- /dev/null
++++ b/migrations/0017_automatic_resets.sql
+@@ -0,0 +1,28 @@
++-- Reset polling and playback never consume the independent trade upload budget.
++ALTER TABLE api_usage ADD COLUMN reset_calls INTEGER NOT NULL DEFAULT 0;
++
++-- Durable opt-in requests. Entry existence alone never completes a request.
++CREATE TABLE automatic_resets (
++ user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++ trade_id INTEGER NOT NULL REFERENCES trades(id) ON DELETE CASCADE,
++ created_at INTEGER NOT NULL,
++ completed_at INTEGER,
++ attempt_id TEXT,
++ audio_id TEXT,
++ duration_seconds REAL,
++ started_at REAL,
++ progress_at REAL,
++ position_seconds REAL NOT NULL DEFAULT 0,
++ played_seconds REAL NOT NULL DEFAULT 0,
++ PRIMARY KEY(user_id, trade_id)
++);
++CREATE INDEX automatic_resets_pending ON automatic_resets(user_id, completed_at, trade_id);
++CREATE TABLE reset_handoffs (
++ token_hash TEXT PRIMARY KEY,
++ user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++ trade_id INTEGER NOT NULL REFERENCES trades(id) ON DELETE CASCADE,
++ device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
++ expires_at INTEGER NOT NULL,
++ used_at INTEGER
++);
++CREATE INDEX reset_handoffs_expiry ON reset_handoffs(expires_at);
+diff --git a/public/app/js/automatic-playback.js b/public/app/js/automatic-playback.js
+new file mode 100644
+index 0000000..baeb4b2
+--- /dev/null
++++ b/public/app/js/automatic-playback.js
+@@ -0,0 +1,78 @@
++// Browser-side playback proof. The server independently enforces elapsed time,
++// ownership, subscription, attempt identity and completion. No device credential.
++export class AutomaticPlayback {
++  constructor(post, now = () => performance.now()) {
++    this.post = post;
++    this.now = now;
++    this.closed = false;
++    this.invalid = false;
++    this.ready = false;
++    this.position = 0;
++    this.lastPosition = 0;
++    this.lastAt = now();
++    this.queue = Promise.resolve();
++  }
++
++  async start(tradeId, audioId) {
++    this.tradeId = tradeId;
++    const result = await this.post('/api/resets/start', { trade_id: tradeId, audio_id: audioId });
++    if (this.closed) return;
++    if (!result.attempt_id || !Number.isFinite(result.duration_seconds) || result.duration_seconds <= 0) throw new Error('Invalid audio start confirmation.');
++    this.attempt = result.attempt_id;
++    this.duration = result.duration_seconds;
++    this.lastAt = this.now();
++  }
++
++  observe(audio) {
++    if (this.closed) throw new Error('Reset was closed. Reopen it to listen again.');
++    if (this.invalid) throw new Error('Playback was interrupted. Restart this reset.');
++    if (!this.attempt) return;
++    const at = this.now();
++    const position = audio.currentTime;
++    const delta = position - this.lastPosition;
++    const elapsed = Math.max(0, (at - this.lastAt) / 1000);
++    if (!Number.isFinite(position) || position < 0 || audio.playbackRate !== 1
++      || (audio.seeking && position > 0.25) || delta < -0.25 || delta > elapsed * 1.1 + 0.75) {
++      this.invalid = true;
++      this.ready = false;
++      throw new Error('Playback changed or skipped. Restart this reset and listen from the beginning.');
++    }
++    this.position = Math.max(this.position, position);
++    this.lastPosition = position;
++    this.lastAt = at;
++  }
++
++  progress() {
++    if (this.closed || this.invalid || !this.attempt) return Promise.resolve();
++    const position = this.position;
++    const next = this.queue.catch(() => {}).then(() => {
++      if (this.closed || this.invalid) throw new Error('Reset was closed or playback interrupted.');
++      return this.post('/api/resets/progress', { trade_id: this.tradeId, attempt_id: this.attempt, position_seconds: position });
++    });
++    this.queue = next;
++    return next;
++  }
++
++  async ended(audio) {
++    this.observe(audio);
++    if (!audio.ended || !Number.isFinite(audio.duration) || audio.duration <= 0
++      || audio.currentTime < audio.duration - 0.5) throw new Error('The audio has not ended.');
++    const result = await this.progress();
++    if (this.closed) throw new Error('Reset was closed.');
++    if (!result?.ready) throw new Error('Audio playback was not confirmed. Restart this reset and listen again.');
++    this.ready = true;
++  }
++
++  async complete(entry) {
++    if (this.closed) throw new Error('Reset was closed.');
++    if (!this.ready || this.invalid) throw new Error('Listen to the full audio before completing this reset.');
++    if (!Number.isInteger(entry.tilt_after) || entry.tilt_after < 0 || entry.tilt_after > 10) throw new Error('Choose your final tilt first.');
++    const result = await this.post('/api/resets/complete', {
++      trade_id: this.tradeId, attempt_id: this.attempt, done: true, entry,
++    });
++    if (result?.status !== 'completed') throw new Error('The server did not confirm reset completion.');
++    return result;
++  }
++
++  cancel() { this.closed = true; this.ready = false; }
++}
+diff --git a/public/app/js/calendar.js b/public/app/js/calendar.js
+index 7c08c59..d9a4063 100644
+--- a/public/app/js/calendar.js
++++ b/public/app/js/calendar.js
+@@ -50,7 +50,7 @@ function drawDay(date) {
+   const tilt = renderTiltChart($('cal-day-chart'), day?.samples || [], { date, entries: day?.entries || [] });
+   const t = dayTotals(day);
+   renderDayPnlChart($('cal-day-pnl'), day?.entries || [], date, { range: tilt?.layout === 'time' ? { first: tilt.firstMinute, last: tilt.lastMinute } : null,
+-    savedCents: t.pnlEdited ? t.pnlCents : null });
++    ntTrades: day?.ntTrades || [], savedCurrency: day?.summary?.currency, savedCents: t.pnlEdited ? t.pnlCents : null });
+   renderGradeSummary($('cal-day-grades'), store.entries, date, day?.extraGrades, 'Trade grades');
+   if (!list.children.length) list.append(el('li', 'muted', 'No entries this day.'));
+ }
+diff --git a/public/app/js/main.js b/public/app/js/main.js
+index 98ef268..7f5ea6c 100644
+--- a/public/app/js/main.js
++++ b/public/app/js/main.js
+@@ -8,7 +8,7 @@ import { initCalendar, renderCalendar } from './calendar.js';
+ import { initNt, renderNt } from './ninjatrader.js';
+ import { initTrades } from './nt-trades.js';
+ import { initRed } from './red.js';
+-import { initReset } from './reset.js';
++import { initAutomaticReset, initReset } from './reset.js';
+ import { initToday, renderToday } from './today.js';
+ 
+ const SECTIONS = ['today', 'journal', 'breathe', 'audios', 'platforms', 'account'];
+@@ -75,6 +75,7 @@ async function boot() {
+   onChange(redraw);
+   window.addEventListener('hashchange', route);
+   route();
++  initAutomaticReset();
+ }
+ 
+ boot().catch((e) => {
+diff --git a/public/app/js/nt-trades.js b/public/app/js/nt-trades.js
+index 88a8eb4..7dd31b8 100644
+--- a/public/app/js/nt-trades.js
++++ b/public/app/js/nt-trades.js
+@@ -36,7 +36,9 @@ export function tradeRow(t, { linked = false, tag = false, today = false } = {})
+     li.classList.add('new');
+     li.append(el('span', 'nt-new', 'new'));
+   }
+-  if (linked) li.append(el('span', 'muted trade-done', today ? 'Logged' : 'reset done'));
++  if (t.reset_status === 'completed') li.append(el('span', 'muted trade-done', 'Reset complete'));
++  else if (t.reset_status === 'pending') li.append(el('span', 'muted trade-done', 'Reset pending — reopen in NinjaTrader'));
++  else if (linked) li.append(el('span', 'muted trade-done', 'Logged'));
+   else if (today) {
+     const button = el('button', 'pill pill-main pill-small', 'Reset');
+     button.type = 'button';
+diff --git a/public/app/js/reset.js b/public/app/js/reset.js
+index 9a8a1ad..30094a1 100644
+--- a/public/app/js/reset.js
++++ b/public/app/js/reset.js
+@@ -6,7 +6,8 @@
+ // (step 3), so the reset itself asks for no rating.
+ import { OTHER, TRIGGERS, findPair, isRecordedTrade, reprogramLines, resetReminder } from '/js/picker.js';
+ import { exitTimeText, tradeLine, tradeTrigger as ntTradeTrigger } from '/js/trades.js';
+-import { addEntry, localStamp, newRequestId, store, todayEntries, updateEntry } from './api.js';
++import { addEntry, changed, localStamp, newRequestId, post, store, todayEntries, updateEntry } from './api.js';
++import { AutomaticPlayback } from './automatic-playback.js';
+ import { BREATH_IN, BREATH_OUT, BREATH_ROUNDS, keepAwake, makeClock, renderBreath, stopBreathTimer } from './breath.js';
+ import { closeRed, redOpen, showRed } from './red.js';
+ import { buildRuler } from './ruler.js';
+@@ -15,6 +16,68 @@ import { showRule } from './tilt.js';
+ import { pnlFieldValue, renderGradeRows, renderPnlField } from './trade-grades.js';
+ 
+ const $ = (id) => document.getElementById(id);
++let automatic = null;
++let pendingAutomatic = null;
++let automaticOpening = false;
++let progressTimer = 0;
++let endConfirming = false;
++
++function automaticMessage(text) {
++  const box = $('automatic-reset-status');
++  if (box) { box.querySelector('span').textContent = text; box.hidden = !text; }
++  if ($('run-auto-status')) { $('run-auto-status').textContent = text; $('run-auto-status').hidden = !text; }
++}
++
++// The fragment is a short-lived one-use handoff, never the device credential.
++export function initAutomaticReset() {
++  const box = el('p', 'small'); box.id = 'automatic-reset-status'; box.hidden = true;
++  box.setAttribute('role', 'status');
++  const retry = el('button', 'pill pill-small', 'Reopen pending reset'); retry.type = 'button';
++  retry.addEventListener('click', () => {
++    if (!pendingAutomatic || run.open || pickerOpen()) return;
++    openPicker(pendingAutomatic.trade, true);
++  });
++  box.append(el('span'), document.createTextNode(' '), retry);
++  $('loading').after(box);
++  const beforeBox = el('div', 'ruler-wrap'); beforeBox.id = 'automatic-before'; beforeBox.hidden = true;
++  const title = el('p', 'step3-title', 'Your tilt before this reset'); title.id = 'automatic-before-title';
++  const ruler = el('div', 'tilt-ruler'); ruler.setAttribute('role', 'group'); ruler.setAttribute('aria-labelledby', title.id);
++  const tip = el('div', 'ruler-tip'); tip.hidden = true;
++  beforeBox.append(title, ruler, tip); $('pick-choose').prepend(beforeBox);
++  buildRuler(ruler, tip, (n, button) => {
++    if (!automatic) return;
++    automatic.before = n; automatic.beforeLocal = localStamp();
++    for (const item of ruler.children) item.setAttribute('aria-pressed', String(item === button));
++    drawChoice();
++  });
++  const open = async () => {
++    const match = /^#nt-reset=([A-Za-z0-9_-]{20,150})$/.exec(location.hash);
++    if (!match || automaticOpening) return;
++    automaticOpening = true;
++    history.replaceState(null, '', location.pathname + location.search + '#today');
++    try {
++      if (run.open) endRun();
++      if (pickerOpen()) closePicker(false);
++      automatic = null;
++      pendingAutomatic = null;
++      const result = await post('/api/resets/open', { handoff: match[1] });
++      if (result.status === 'completed') { automaticMessage('This reset is already complete.'); return; }
++      if (!result.trade || !Number.isSafeInteger(result.trade.id)) throw new Error('Invalid reset response');
++      automatic = { trade: result.trade, entry: result.entry, before: undefined };
++      pendingAutomatic = automatic;
++      result.trade.reset_status = 'pending';
++      const index = store.trades.findIndex(t => t.id === result.trade.id);
++      if (index < 0) store.trades.push(result.trade); else store.trades[index] = result.trade;
++      automaticMessage('Trade saved. This reset remains pending until you finish the audio, rate your tilt and choose Done.');
++      closeRed();
++      openPicker(result.trade, true);
++    } catch {
++      automaticMessage('Could not open this reset. Sign in as the member connected to NinjaTrader, then reopen it from the add-on.');
++    } finally { automaticOpening = false; }
++  };
++  window.addEventListener('hashchange', open);
++  open();
++}
+ const pad = (x) => String(x).padStart(2, '0');
+ const el = (tag, cls, text) => {
+   const e = document.createElement(tag);
+@@ -99,14 +162,22 @@ function hidePic() {
+ // pair.pnl = the P/L he typed in the picker: saved with a recorded trade only, never with "Reset again"; not typed
+ // = no pnl_cents key at all.
+ function newJob(pair, audioId, again = false) {
+-  const s = stepNow();
++  const context = automatic && pair.tradeId === automatic.trade.id ? automatic : null;
++  const s = context ? { before: context.before, beforeLocal: context.beforeLocal } : stepNow();
+   const values = s.before === undefined ? {} : { tilt_before: s.before, tilt_before_local: s.beforeLocal };
++  if (context?.entry) {
++    for (const key of ['note', 'helped', 'setup_grade', 'rules_kept']) {
++      if (context.entry[key] !== undefined) values[key] = context.entry[key];
++    }
++  }
+   if (!again && Number.isInteger(pair.pnl) && tradeTrigger(pair.trigger.key)) values.pnl_cents = pair.pnl;
+   if (!again && pair.tradeId && tradeTrigger(pair.trigger.key)) values.trade_id = pair.tradeId;
+-  return { pair, audioId, again, logicId: pair.logic?.id ?? null, local: localStamp(), requestId: newRequestId(), entryId: null, values, queue: Promise.resolve() };
++  return { pair, audioId, again: context ? false : again, automatic: context, logicId: pair.logic?.id ?? null,
++    local: localStamp(), requestId: newRequestId(), entryId: null, values, queue: Promise.resolve() };
+ }
+ function saveJob(job, fields = {}) {
+   Object.assign(job.values, fields);
++  if (job.automatic) return job.queue; // Automatic drafts are saved only by the confirmed Done operation.
+   const values = { ...job.values, tapped_at: Date.now() }; // capture this tap, not the later retry/queue time
+   job.queue = job.queue.then(async () => {
+     if (!job.entryId) {
+@@ -156,6 +227,7 @@ function drawPicker() {
+   const triggers = $('pick-triggers');
+   triggers.textContent = '';
+   for (const t of TRIGGERS) {
++    if (automatic && t.key !== ntTradeTrigger(automatic.trade)) continue;
+     triggers.append(choiceButton(t.label, pick.trigger === t.key, () => {
+       pick.trigger = t.key;
+       pick.thought = null;
+@@ -167,16 +239,16 @@ function drawPicker() {
+       if (!tradeTrigger(t.key)) { pick.pnlText = ''; pick.tradeId = null; }
+       else if (draft?.trigger === t.key) {
+         ({ text: pick.pnlText, sign: pick.pnlSign } = draft);
+-        pick.tradeId = store.me.nt_addon ? draft.tradeId ?? null : null;
++        pick.tradeId = automatic ? automatic.trade.id : store.me.nt_addon ? draft.tradeId ?? null : null;
+       } else if (pick.pnlText || pick.tradeId) keepPnl(t.key, pick.pnlText, pick.pnlSign, pick.tradeId);
+       drawPicker();
+       $('pick-triggers').querySelector('[aria-pressed="true"]').focus();
+     }));
+   }
+-  $('pick-pnl').hidden = !tradeTrigger(pick.trigger);
++  $('pick-pnl').hidden = Boolean(automatic) || !tradeTrigger(pick.trigger);
+   pnlField = $('pick-pnl').hidden ? null : renderPnlField($('pick-pnl'), { id: 'pick-pnl-input', text: pick.pnlText, sign: pick.pnlSign,
+     onChange: ({ text, sign }) => { pick.pnlText = text; pick.pnlSign = sign; keepPnl(pick.trigger, text, sign, pick.tradeId); } });
+-  const trade = store.me.nt_addon && pick.tradeId ? store.trades.find((t) => t.id === pick.tradeId) : null;
++  const trade = automatic?.trade || (store.me.nt_addon && pick.tradeId ? store.trades.find((t) => t.id === pick.tradeId) : null);
+   $('pick-trade').hidden = !trade;
+   $('pick-trade').textContent = trade ? `From NinjaTrader: ${tradeLine(trade)} · ${exitTimeText(trade)}` : '';
+   if (pick.tradeId && pnlField) {
+@@ -225,19 +297,22 @@ function drawChoice() {
+   for (const button of $('pick-logic').children) {
+     button.setAttribute('aria-pressed', String(button.dataset.lineId === pick.logic?.id));
+   }
+-  $('pick-play').disabled = !pick.logic;
++  $('pick-play').disabled = !pick.logic || (automatic && automatic.before === undefined);
++  $('pick-log').hidden = Boolean(automatic);
+   $('pick-play-hint').hidden = $('pick-reminder').hidden || Boolean(pick.logic);
+ }
+ 
+-export function openPicker(trade = null) {
++export function openPicker(trade = null, resumeAutomatic = false) {
+   if (run.open || redOpen()) return;
+-  if (!canStartReset()) { nudgeStep(); return; } // step 1 first: the tilt before, on the Today ruler
++  automatic = resumeAutomatic ? pendingAutomatic : null;
++  if (automatic) trade = automatic.trade;
++  if (!automatic && !canStartReset()) { nudgeStep(); return; } // step 1 first for ordinary resets
+   pick.trigger = null;
+   pick.thought = null;
+   pick.logic = null;
+   pick.pnlText = '';
+   pick.pnlSign = '+';
+-  pick.tradeId = store.me.nt_addon ? trade?.id ?? null : null;
++  pick.tradeId = automatic ? automatic.trade.id : store.me.nt_addon ? trade?.id ?? null : null;
+   if (pick.tradeId) {
+     pick.trigger = ntTradeTrigger(trade);
+     ({ text: pick.pnlText, sign: pick.pnlSign } = pnlFieldValue(trade.pnl_cents, pick.pnlSign));
+@@ -245,6 +320,7 @@ export function openPicker(trade = null) {
+   }
+   $('pick-choose').hidden = false;
+   $('pick-logged').hidden = true;
++  if ($('automatic-before')) $('automatic-before').hidden = !automatic;
+   drawPicker();
+   $('picker').hidden = false;
+   document.body.classList.add('locked');
+@@ -259,6 +335,7 @@ function closePicker(focusBack = true) {
+ 
+ // The typed P/L before Play or Log: { ok, cents }. A wrong number → the hint, the field gets focus, nothing starts.
+ function readPnl() {
++  if (automatic) return { ok: true, cents: automatic.trade.pnl_cents };
+   if (!pnlField) return { ok: true, cents: null };
+   const read = pnlField.read();
+   if (!read.ok) pnlField.focus();
+@@ -269,6 +346,7 @@ function readPnl() {
+ // ruler), then the grade rows (a recorded trade only) and Done, like the end of a reset.
+ let logJob = null;
+ function logWithoutAudio() {
++  if (automatic) return;
+   const pair = findPair(pick.trigger, pick.thought);
+   if (!pair) return;
+   const pnl = readPnl();
+@@ -340,6 +418,7 @@ function showVoice() {
+ }
+ 
+ function toggleVoice() {
++  if (run.job?.automatic && run.open) return;
+   voiceOn = !voiceOn;
+   try { localStorage.setItem(VOICE_KEY, voiceOn ? 'on' : 'off'); } catch { /* storage blocked */ }
+   showVoice();
+@@ -361,6 +440,12 @@ let stallTimer = 0;
+ function voiceFailed() {
+   clearTimeout(stallTimer);
+   if (!run.open || run.done || !run.audio) return;
++  if (run.job?.automatic) {
++    audio.pause(); run.clock.pause();
++    $('run-pause').textContent = 'Resume';
++    automaticMessage('Audio was interrupted. Resume playback, or stop and reopen this pending reset.');
++    return;
++  }
+   const paused = !run.clock.running(); // the step clock runs with the voice too; Pause stops both
+   run.audio = false;
+   run.voiceBroken = true;
+@@ -401,14 +486,16 @@ function breathTime(t) {
+ }
+ 
+ // Opens the overlay and starts the sound inside the same tap (phones play sound only from a tap).
+-function startReset(pair, again = false) {
++async function startReset(pair, again = false) {
++  if (run.job?.proof) run.job.proof.cancel();
++  clearInterval(progressTimer); endConfirming = false;
+   pauseOthers();
+   closeRed();
+   stopBreathTimer();
+   const audioId = pair.audioId;
+   // "Reset again": its tilt before is the tilt after of the reset that just ended.
+   if (again && run.job?.values.tilt_after !== undefined) beforeDone(run.job.values.tilt_after, run.job.values.tilt_after_local);
+-  resetStarted();
++  if (!automatic) resetStarted();
+   run.job = newJob(pair, audioId, again);
+   jobGradeRows($('run-grade'), run.job);
+   run.marks = marksFor(audioId);
+@@ -422,11 +509,40 @@ function startReset(pair, again = false) {
+   $('run-after').hidden = true;
+   $('run-rate').hidden = true;
+   $('run-rule').hidden = true;
+-  $('run-note').value = '';
++  $('run-note').value = run.job.values.note || '';
+   $('run').hidden = false;
+   showPic();
+   document.body.classList.add('locked');
+   keepAwake(true);
++  $('run-auto-confirm').hidden = true;
++  $('run-auto-status').hidden = !run.job.automatic;
++  $('run-done').disabled = false;
++  $('run-again').hidden = Boolean(run.job.automatic);
++  for (const b of document.querySelectorAll('.js-voice')) b.disabled = Boolean(run.job.automatic);
++  if (run.job.automatic) {
++    const job = run.job;
++    job.proof = new AutomaticPlayback(post);
++    job.previousVoice = voiceOn;
++    voiceOn = true; showVoice();
++    audio.playbackRate = 1;
++    $('run-do').textContent = 'Preparing your reset...';
++    setControls(false);
++    try {
++      if (!run.marks) throw new Error('Audio timing is unavailable. Reopen this reset.');
++      await job.proof.start(job.pair.tradeId, audioId);
++      if (!run.open || run.job !== job || job.proof.closed) return;
++      progressTimer = setInterval(() => {
++        if (run.open && run.job === job && !run.done && job.proof.position > 0) {
++          job.proof.progress().catch(() => {
++            if (run.open && run.job === job) automaticMessage('Playback confirmation is waiting for the network. The reset is still pending.');
++          });
++        }
++      }, 5000);
++    } catch {
++      if (run.open && run.job === job) automaticMessage('Could not start the audio reset. Stop and reopen it when your connection is available.');
++      return;
++    }
++  }
+   goStep(0);
+   $('run-pause').focus();
+   cancelAnimationFrame(run.frame);
+@@ -457,7 +573,7 @@ function goStep(i, keepAudio) {
+ 
+ function setControls(finished) {
+   $('run-pause').hidden = finished;
+-  $('run-skip').hidden = finished;
++  $('run-skip').hidden = finished || Boolean(run.job?.automatic);
+   $('run-stop').hidden = finished;
+   $('run-end').hidden = !finished;
+   $('run-pause').textContent = 'Pause';
+@@ -466,6 +582,7 @@ function setControls(finished) {
+ // The audio ended: step 3 on this screen, the tilt after. Done / Reset again, the checklist, the grade rows and the
+ // note come after it.
+ function finish() {
++  if (run.job?.automatic && !run.job.proof?.ready) return;
+   run.done = true;
+   run.clock.pause();
+   audio.pause();
+@@ -475,7 +592,7 @@ function finish() {
+   $('run-say').hidden = true;
+   $('run-checks').hidden = true;
+   $('run-rate').hidden = false;
+-  afterStep(run.job.entryId);
++  if (!run.job.automatic) afterStep(run.job.entryId);
+   const job = run.job;
+   job.queue.then(() => { if (job.entryId) afterStep(job.entryId); });
+   buzz();
+@@ -484,6 +601,8 @@ function finish() {
+ }
+ 
+ function closeRun() {
++  clearInterval(progressTimer);
++  if (run.job?.proof) run.job.proof.cancel();
+   clearTimeout(stallTimer);
+   run.open = false;
+   cancelAnimationFrame(run.frame);
+@@ -494,7 +613,9 @@ function closeRun() {
+   hidePic();
+   if (!pickerOpen() && !redOpen()) document.body.classList.remove('locked');
+   keepAwake(false);
+-  showDone();
++  for (const b of document.querySelectorAll('.js-voice')) b.disabled = false;
++  if (typeof run.job?.previousVoice === 'boolean') { voiceOn = run.job.previousVoice; showVoice(); }
++  if (!run.job?.automatic) showDone();
+ }
+ 
+ function togglePause() {
+@@ -513,12 +634,22 @@ function togglePause() {
+ // Next step. The Skip button moves the audio too; the loop calls it when the time (or the audio) got there.
+ function skip(fromLoop) {
+   if (run.done) return;
++  if (run.job?.automatic && fromLoop !== true) return;
+   if (run.i < STEPS.length - 1) goStep(run.i + 1, fromLoop === true);
+   else finish();
+ }
+ 
+ function loop() {
+   if (!run.open) return;
++  if (run.job?.automatic && !run.done) {
++    try { run.job.proof.observe(audio); }
++    catch {
++      audio.pause(); run.clock.pause();
++      automaticMessage('Playback changed or skipped. Stop and reopen this reset to listen from the beginning.');
++      return;
++    }
++    if (audio.ended && !run.job.audioConfirmationAttempted) confirmAutomaticAudio();
++  }
+   let s = STEPS[run.i];
+   let t = stepTime();
+   if (!run.done && (t >= stepLen(run.i) || (run.audio && audio.ended))) {
+@@ -544,13 +675,13 @@ function loop() {
+ // Step 3: the tilt after (again = a change). Then Done / Reset again above the checklist, the grade rows and the note.
+ function rateAfter(n) {
+   saveJob(run.job, { tilt_after: n, tilt_after_local: localStamp() });
+-  afterDone(n);
+-  if (n >= 7) {
++  if (!run.job.automatic) afterDone(n);
++  if (n >= 7 && !run.job.automatic) {
+     closeRun();
+     showRed('Red line: tilt 7 or higher.', $('pick-open'));
+     return;
+   }
+-  const a = afterLines(n, run.job);
++  const a = n >= 7 ? { lines: ['Red line: tilt 7 or higher. Stop for today.'], band: 'r' } : afterLines(n, run.job);
+   $('run-say').hidden = !a.green;
+   $('run-checks').hidden = !a.green;
+   showRule($('run-rule'), n, a.lines, a.band);
+@@ -560,10 +691,54 @@ function rateAfter(n) {
+ 
+ // Done, Stop or Esc.
+ function endRun() {
++  if (run.job?.automatic) automaticMessage('Reset is still pending. Reopen it when you are ready to finish.');
+   closeRun();
+   focusBack(run.job);
+ }
+ 
++async function confirmAutomaticAudio() {
++  const job = run.job;
++  if (!job?.automatic || endConfirming || job.proof.ready || !audio.ended) return;
++  endConfirming = true;
++  job.audioConfirmationAttempted = true;
++  $('run-auto-confirm').hidden = true;
++  clearInterval(progressTimer);
++  try {
++    await job.proof.ended(audio);
++    if (run.open && run.job === job) { automaticMessage('Audio finished. Choose your final tilt, then Done.'); finish(); }
++  } catch {
++    if (run.open && run.job === job) {
++      automaticMessage('Audio completion was not confirmed. Check your connection, then choose Retry confirmation or stop and reopen.');
++      $('run-auto-confirm').hidden = false;
++    }
++  } finally { endConfirming = false; }
++}
++
++async function doneRun() {
++  const job = run.job;
++  if (!job?.automatic) { endRun(); return; }
++  if ($('run-done').disabled) return;
++  $('run-done').disabled = true;
++  saveNote();
++  try {
++    const result = await job.proof.complete({ kind: 'after_trade', trigger: job.pair.trigger.key, thought: job.pair.thought.key,
++      audio_id: job.audioId, logic_id: job.logicId, local: job.local, again: false, tapped_at: Date.now(), ...job.values });
++    if (!run.open || run.job !== job) return;
++    if (result.entry) {
++      const index = store.entries.findIndex(e => e.id === result.entry.id);
++      if (index < 0) store.entries.push(result.entry); else store.entries[index] = result.entry;
++    }
++    const trade = store.trades.find(t => t.id === job.pair.tradeId);
++    if (trade) trade.reset_status = 'completed';
++    automatic = null;
++    pendingAutomatic = null;
++    automaticMessage('Reset completed. Your trade was counted once.');
++    closeRun(); changed();
++  } catch {
++    if (run.open && run.job === job) automaticMessage('Reset completion was not confirmed. Check your connection and choose Done again.');
++  } finally { if (run.job === job) $('run-done').disabled = false; }
++}
++
+ function saveNote() {
+   const note = $('run-note').value.trim();
+   if ((run.job.values.note || '') === note) return;
+@@ -608,6 +783,10 @@ function onKey(e) {
+ }
+ 
+ export function initReset() {
++  const autoStatus = el('p', 'small'); autoStatus.id = 'run-auto-status'; autoStatus.setAttribute('role', 'status'); autoStatus.hidden = true;
++  const autoRetry = el('button', 'pill pill-small', 'Retry confirmation'); autoRetry.id = 'run-auto-confirm'; autoRetry.type = 'button'; autoRetry.hidden = true;
++  autoRetry.addEventListener('click', confirmAutomaticAudio);
++  $('run-end').before(autoStatus, autoRetry);
+   const box = document.querySelector('#run-checks .checks');
+   for (const text of CHECKS) {
+     const label = el('label');
+@@ -633,7 +812,7 @@ export function initReset() {
+   $('run-pause').addEventListener('click', togglePause);
+   $('run-skip').addEventListener('click', skip);
+   $('run-stop').addEventListener('click', endRun);
+-  $('run-done').addEventListener('click', endRun);
++  $('run-done').addEventListener('click', doneRun);
+   $('run-again').addEventListener('click', () => startReset(run.job.pair, true));
+   $('run-note').addEventListener('change', saveNote);
+   $('run-note').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); saveNote(); } });
+diff --git a/public/js/day-pnl-chart.js b/public/js/day-pnl-chart.js
+index ca92117..f12f54a 100644
+--- a/public/js/day-pnl-chart.js
++++ b/public/js/day-pnl-chart.js
+@@ -18,14 +18,24 @@ function roundUp(cents) {
+ }
+ 
+ // entries = the day's entries, date = 'YYYY-MM-DD', range = { first, last } minutes of the tilt chart (or null).
+-// → null when no trade of that date has a typed P/L.
+-export function dayPnlGeometry(entries, date, range = null) {
++// ntTrades are independent imported trades; linked reset entries never add money.
++// Returns null when no trade of that date has P/L.
++export function dayPnlGeometry(entries, date, range = null, ntTrades = []) {
+   const width = 600, left = 40, right = 64, top = 40, bottom = 190;
+-  const trades = entries.filter((e) => isRecordedTrade(e) && e.local_date === date && Number.isInteger(e.pnl_cents)).map((e) => {
++  const trades = entries.filter((e) => isRecordedTrade(e) && e.trade_id == null && e.local_date === date && Number.isInteger(e.pnl_cents)).map((e) => {
+     const stamp = parseLocalStamp(e.tilt_before_local);
+     const exact = stamp?.date === date;
+     return { entry: e, cents: e.pnl_cents, minutes: exact ? stamp.minutes : (e.local_hour ?? 0) * 60, approximate: !exact };
+-  }).sort((a, b) => a.minutes - b.minutes || a.entry.ts - b.entry.ts || a.entry.id - b.entry.id);
++  });
++  // Match trade-list browser-local clocks. The imported calendar day remains authoritative;
++  // a different browser timezone is disclosed instead of silently moving the trade to another day.
++  for (const t of ntTrades.filter((t) => t.local_date === date)) {
++    const exit = new Date(t.exit_time);
++    const browserDate = `${exit.getFullYear()}-${pad(exit.getMonth() + 1)}-${pad(exit.getDate())}`;
++    trades.push({ entry: t, cents: t.pnl_cents, minutes: exit.getHours() * 60 + exit.getMinutes(),
++      approximate: false, imported: true, browserDate, dateMismatch: browserDate !== date });
++  }
++  trades.sort((a, b) => a.minutes - b.minutes || (a.entry.exit_time ?? a.entry.ts) - (b.entry.exit_time ?? b.entry.ts) || a.entry.id - b.entry.id);
+   if (!trades.length) return null;
+   const first = Math.min(range?.first ?? Infinity, trades[0].minutes);
+   const last = Math.max(range?.last ?? -Infinity, trades.at(-1).minutes);
+@@ -46,7 +56,8 @@ export function dayPnlGeometry(entries, date, range = null) {
+   const path = [`M ${left},${zeroY}`, ...points.map((p) => `H ${p.x} V ${p.y}`), `H ${plotRight}`].join(' ');
+   const ticks = clockTicks({ minutes: first, time: clock(first), approximate: false }, { minutes: last, time: clock(last), approximate: false }, x)
+     .map((t) => ({ x: x(t.minutes), label: t.time, anchor: t.anchor }));
+-  return { width, height: bottom + 44, left, right, top, bottom, x, y, zeroY, points, path, area: `${path} V ${zeroY} H ${left} Z`, totalCents: sum,
++  const currencies = [...new Set(trades.filter((t) => t.imported).map((t) => t.entry.currency))];
++  return { currencies, mixedCurrency: currencies.length > 1, dateMismatch: trades.some((t) => t.dateMismatch), width, height: bottom + 44, left, right, top, bottom, x, y, zeroY, points, path, area: `${path} V ${zeroY} H ${left} Z`, totalCents: sum,
+     yTicks: [{ y: zeroY, label: '0' }, ...(flat ? [] : [hi > 0 && { y: y(hi), label: compactAmount(hi) }, lo < 0 && { y: y(lo), label: compactAmount(lo) }].filter(Boolean))],
+     ticks, end: { x: plotRight, y: y(sum), label: compactAmount(sum) } };
+ }
+@@ -67,16 +78,16 @@ const signOf = (cents) => (cents > 0 ? 'pos' : cents < 0 ? 'neg' : '');
+ let charts = 0; // unique clipPath ids
+ 
+ // savedCents = the day P/L he saved (Journal → Edit) or null: when it is not the chart's sum, a short note says so.
+-export function renderDayPnlChart(box, entries, date, { range = null, savedCents = null } = {}) {
++export function renderDayPnlChart(box, entries, date, { range = null, savedCents = null, savedCurrency = null, ntTrades = [] } = {}) {
+   box.textContent = '';
+   box.className = 'tilt-chart day-pnl-chart';
+-  const g = dayPnlGeometry(entries, date, range);
++  const g = dayPnlGeometry(entries, date, range, ntTrades);
+   if (!g) {
+     box.append(el('p', 'muted chart-empty', 'No P/L typed for a trade on this day.'));
+     return;
+   }
+   const plotRight = g.width - g.right;
+-  const line = (p) => `${p.time} · ${triggerLabel(p.entry.trigger)} · P/L ${formatAmount(p.cents)} · day ${formatAmount(p.sumCents)}`;
++  const line = (p) => `${p.time} · ${p.imported ? `${p.entry.instrument} (${p.entry.currency})` : triggerLabel(p.entry.trigger)} · P/L ${formatAmount(p.cents)} · day ${formatAmount(p.sumCents)}`;
+   const svg = svgNode('svg', { viewBox: `0 0 ${g.width} ${g.height}`, role: 'img',
+     'aria-label': `P/L of the day ${date}: ${g.points.length} trade${g.points.length === 1 ? '' : 's'} with P/L, day ${formatAmount(g.totalCents)}. ${g.points.map(line).join('; ')}.` });
+   svg.append(svgNode('title', {}, `P/L ${date}`));
+@@ -105,7 +116,11 @@ export function renderDayPnlChart(box, entries, date, { range = null, savedCents
+   svg.append(svgNode('text', { x: g.end.x + 8, y: g.end.y + 7, class: `chart-pnl-end ${signOf(g.totalCents)}`.trim() }, g.end.label));
+   for (const tick of g.ticks) svg.append(svgNode('text', { x: tick.x, y: g.height - 14, 'text-anchor': tick.anchor, class: 'chart-axis' }, tick.label));
+   box.append(svg);
++  if (g.currencies.length) box.append(el('p', 'muted small chart-note',
++    `NinjaTrader: ${g.currencies.join(', ')}.${g.mixedCurrency ? ' Mixed currencies; amounts are added without conversion.' : ''} Trade times use the browser timezone.`));
++  if (g.dateMismatch) box.append(el('p', 'muted small chart-note',
++    'Some exit times fall on another date in the browser timezone. Trades remain on their imported calendar day.'));
+   if (savedCents !== null && savedCents !== g.totalCents) {
+-    box.append(el('p', 'muted small chart-note', `The chart adds up the P/L of each trade: ${formatAmount(g.totalCents)}. Your saved day P/L: ${formatAmount(savedCents)}.`));
++    box.append(el('p', 'muted small chart-note', `The chart adds up the P/L of each trade: ${formatAmount(g.totalCents)}. Your saved day P/L: ${formatAmount(savedCents)}${savedCurrency ? ` ${savedCurrency}` : ''}.`));
+   }
+ }
+diff --git a/public/js/stats.js b/public/js/stats.js
+index 5ea672c..261b5e1 100644
+--- a/public/js/stats.js
++++ b/public/js/stats.js
+@@ -46,7 +46,7 @@ export function dayMap(entries, checkins = [], summaries = [], dailyGrades = [],
+         d.resets++;
+         if (!e.audio_id) d.withoutAudio++;
+       }
+-      if (isRecordedTrade(e)) {
++      if (isRecordedTrade(e) && e.trade_id == null) {
+         d.trades++;
+         if (Number.isInteger(e.pnl_cents)) {
+           d.pnlTyped++;
+@@ -82,20 +82,22 @@ export function dayMap(entries, checkins = [], summaries = [], dailyGrades = [],
+ 
+ // The trades and the P/L of a day as the Journal shows them (calendar cell and day view). A value he saved for the day
+ // (Journal → Edit: the daily_summaries row) wins; an empty saved value = the count of his recorded trades and the sum
+-// of their typed P/L (dayMap). On a NinjaTrader day, auto values are its trades plus original hand logs with typed
+-// P/L and no trade link. A linked reset never adds to the totals. day = one dayMap value or undefined.
++// of their typed P/L (dayMap). On a NinjaTrader day, auto values are its trades plus original hand logs
++// with no trade link (untyped logs still count as trades). A linked reset never adds to the totals. day = one dayMap value or undefined.
+ export function dayTotals(day) {
+   const saved = day?.summary;
+   const tradesEdited = Number.isInteger(saved?.trades);
+   const pnlEdited = Number.isInteger(saved?.pnl_cents);
+   const ntTrades = day?.ntTrades?.length || 0;
+   const manual = ntTrades ? (day.entries || []).filter((e) => e.local_date === day.date && isRecordedTrade(e)
+-    && e.trade_id == null && Number.isInteger(e.pnl_cents)) : [];
++    && e.trade_id == null) : [];
+   const ntPnlCents = day?.ntPnlCents ?? null;
+-  const ntTotalPnl = (ntPnlCents ?? 0) + manual.reduce((sum, e) => sum + e.pnl_cents, 0);
++  const ntTotalPnl = (ntPnlCents ?? 0) + manual.reduce((sum, e) => sum + (e.pnl_cents ?? 0), 0);
+   return { trades: tradesEdited ? saved.trades : ntTrades ? ntTrades + manual.length : day?.trades || 0,
+     pnlCents: pnlEdited ? saved.pnl_cents : ntTrades ? ntTotalPnl : day?.pnlCents ?? null,
+     tradesEdited, pnlEdited, autoTrades: day?.trades || 0, pnlTyped: day?.pnlTyped || 0,
++    totalTyped: ntTrades + (day?.pnlTyped || 0),
++    currencies: pnlEdited && saved.currency ? [saved.currency] : [...(day?.ntCurrencies || [])],
+     fromNt: ntTrades > 0 && (!tradesEdited || !pnlEdited), ntTrades, ntPnlCents, mixedCurrency: (day?.ntCurrencies?.length || 0) > 1 };
+ }
+ 
+@@ -133,18 +135,21 @@ const round1 = (x) => Math.round(x * 10) / 10;
+ // The "This month" box. month = 'YYYY-MM'. The streak counts all loaded check-ins (12 months).
+ // grades = the month's grades (logged + end-of-session counts); zoneDays = days with ratings whose highest tilt is
+ // 3 or lower, of ratedDays = days with ratings; trades, pnlTyped, pnlCents (null = none typed) as in dayMap.
+-export function monthStats(entries, checkins, month, dailyGrades = []) {
++export function monthStats(entries, checkins, month, dailyGrades = [], trades = [], summaries = []) {
+   const inMonth = entries.filter((e) => e.local_date.startsWith(month));
+   const monthCheckins = checkins.filter((c) => c.local_date.startsWith(month));
+   const resets = inMonth.filter(isReset);
+   const rated = resets.filter((e) => e.audio_id && e.tilt_after !== null && e.tilt_after !== undefined);
+-  const days = [...dayMap(entries, monthCheckins, [], dailyGrades).values()].filter((d) => d.date.startsWith(month));
+-  const pnlTyped = days.reduce((sum, d) => sum + d.pnlTyped, 0);
++  const days = [...dayMap(entries, monthCheckins, summaries, dailyGrades, trades).values()].filter((d) => d.date.startsWith(month));
++  const totals = days.map(dayTotals);
++  const pnlTyped = totals.reduce((sum, t) => sum + (t.pnlEdited ? t.trades : Math.min(t.totalTyped, t.trades)), 0);
++  const currencies = [...new Set(totals.flatMap((t) => t.currencies))];
+   return {
+     grades: addGrades(days.map((d) => d.grades)),
+-    trades: days.reduce((sum, d) => sum + d.trades, 0),
++    trades: totals.reduce((sum, t) => sum + t.trades, 0),
+     pnlTyped,
+-    pnlCents: pnlTyped ? days.reduce((sum, d) => sum + (d.pnlCents ?? 0), 0) : null,
++    pnlCents: totals.some((t) => t.pnlCents !== null) ? totals.reduce((sum, t) => sum + (t.pnlCents ?? 0), 0) : null,
++    currencies, mixedCurrency: currencies.length > 1,
+     ratedDays: days.filter((d) => d.top !== null).length,
+     zoneDays: days.filter((d) => d.top !== null && d.top <= 3).length,
+     resets: resets.length,
+@@ -265,13 +270,13 @@ export function patternWait(entries, today) {
+ }
+ 
+ // One week (Monday..Sunday) for the weekly email. monday = 'YYYY-MM-DD' of that week's Monday.
+-export function weekSummary(entries, checkins, monday) {
++export function weekSummary(entries, checkins, monday, trades = [], summaries = []) {
+   const sunday = addDays(monday, 6);
+   const week = entries.filter((e) => e.local_date >= monday && e.local_date <= sunday);
+   const weekCheckins = checkins.filter((c) => c.local_date >= monday && c.local_date <= sunday);
+   const resets = week.filter(isReset);
+   const rated = resets.filter((e) => e.audio_id && e.tilt_after !== null && e.tilt_after !== undefined);
+-  const days = [...dayMap(entries, weekCheckins).values()].filter((d) => d.date >= monday && d.date <= sunday);
++  const days = [...dayMap(entries, weekCheckins, summaries, [], trades).values()].filter((d) => d.date >= monday && d.date <= sunday);
+   return {
+     monday,
+     sunday,
+@@ -282,6 +287,6 @@ export function weekSummary(entries, checkins, monday) {
+     planKept: weekCheckins.filter((c) => c.followed).length,
+     planDays: weekCheckins.length,
+     streak: streak(checkins.filter((c) => c.local_date <= sunday)),
+-    hasData: week.length > 0 || weekCheckins.length > 0 || days.some((d) => d.samples.length > 0),
++    hasData: week.length > 0 || weekCheckins.length > 0 || days.some((d) => d.samples.length > 0 || d.ntTrades.length > 0 || d.summary),
+   };
+ }
+diff --git a/scripts/automatic-playback.test.mjs b/scripts/automatic-playback.test.mjs
+new file mode 100644
+index 0000000..225e3e1
+--- /dev/null
++++ b/scripts/automatic-playback.test.mjs
+@@ -0,0 +1,94 @@
++import assert from 'node:assert/strict';
++import { test } from 'node:test';
++import { AutomaticPlayback } from '../public/app/js/automatic-playback.js';
++
++function fixture() {
++  let now = 0;
++  const calls = [];
++  const proof = new AutomaticPlayback(async (path, body) => {
++    calls.push({ path, body });
++    if (path.endsWith('/start')) return { attempt_id: 'attempt', duration_seconds: 10 };
++    if (path.endsWith('/progress')) return { played_seconds: body.position_seconds, ready: body.position_seconds >= 10 };
++    return { status: 'completed', entry: { id: 99, trade_id: 7 } };
++  }, () => now);
++  return { proof, calls, advance: (ms) => { now += ms; } };
++}
++const frame = (currentTime, extra = {}) => ({ currentTime, duration: 10, paused: false, ended: false, seeking: false, playbackRate: 1, ...extra });
++
++test('no completion before actual audio ended and explicit final tilt', async () => {
++  const { proof, calls } = fixture();
++  await proof.start(7, 'b1');
++  await assert.rejects(proof.complete({ tilt_after: 3 }), /audio/i);
++  assert.equal(calls.filter(c => c.path.endsWith('/complete')).length, 0);
++});
++
++test('sequential playback, final audio end and Done complete the bound trade once', async () => {
++  const { proof, calls, advance } = fixture();
++  await proof.start(7, 'b1');
++  for (let second = 1; second <= 10; second++) { advance(1000); proof.observe(frame(second)); }
++  await proof.ended(frame(10, { ended: true, paused: true }));
++  await assert.rejects(proof.complete({}), /tilt/i);
++  const result = await proof.complete({ tilt_after: 3 });
++  assert.equal(result.status, 'completed');
++  assert.equal(calls.at(-1).body.trade_id, 7);
++  assert.equal(calls.at(-1).body.attempt_id, 'attempt');
++  assert.equal(calls.at(-1).body.done, true);
++});
++
++test('seeking ahead or accelerated playback cannot satisfy the audio requirement', async () => {
++  for (const bad of [frame(10, { seeking: true }), frame(10), frame(1, { playbackRate: 2 })]) {
++    const { proof, advance } = fixture();
++    await proof.start(7, 'b1');
++    advance(1000);
++    assert.throws(() => proof.observe(bad), /playback/i);
++    await assert.rejects(proof.ended(frame(10, { ended: true })), /playback/i);
++  }
++});
++
++test('closing or network failure never completes a reset', async () => {
++  const { proof, calls } = fixture();
++  await proof.start(7, 'b1');
++  proof.cancel();
++  await assert.rejects(proof.complete({ tilt_after: 3 }), /closed/i);
++  assert.equal(calls.filter(c => c.path.endsWith('/complete')).length, 0);
++  const failed = new AutomaticPlayback(async () => { throw new Error('network'); });
++  await assert.rejects(failed.start(7, 'b1'), /network/);
++  await assert.rejects(failed.complete({ tilt_after: 3 }), /audio/);
++});
++
++test('a paused interval does not create extra progress or prevent normal resume', async () => {
++  const { proof, advance } = fixture();
++  await proof.start(7, 'b1');
++  advance(1000); proof.observe(frame(1));
++  advance(60000); proof.observe(frame(1, { paused: true }));
++  for (let second = 2; second <= 10; second++) { advance(1000); proof.observe(frame(second)); }
++  await proof.ended(frame(10, { ended: true, paused: true }));
++  assert.equal((await proof.complete({ tilt_after: 0 })).status, 'completed');
++});
++
++test('late start response after close cannot reactivate the attempt', async () => {
++  let resolve;
++  const proof = new AutomaticPlayback(() => new Promise(r => { resolve = r; }));
++  const start = proof.start(7, 'b1');
++  proof.cancel();
++  resolve({ attempt_id: 'late', duration_seconds: 10 });
++  await start;
++  await assert.rejects(proof.complete({ tilt_after: 3 }), /closed/);
++});
++
++test('server refusing final progress leaves reset incomplete and retryable', async () => {
++  let now = 0;
++  let available = false;
++  const proof = new AutomaticPlayback(async path => {
++    if (path.endsWith('/start')) return { attempt_id: 'a', duration_seconds: 10 };
++    if (path.endsWith('/progress')) { if (!available) throw new Error('offline'); return { ready: true }; }
++    return { status: 'completed' };
++  }, () => now);
++  await proof.start(7, 'b1');
++  for (let second = 1; second <= 10; second++) { now += 1000; proof.observe(frame(second)); }
++  await assert.rejects(proof.ended(frame(10, { ended: true })), /offline/);
++  await assert.rejects(proof.complete({ tilt_after: 3 }), /audio/);
++  available = true;
++  await proof.ended(frame(10, { ended: true }));
++  assert.equal((await proof.complete({ tilt_after: 3 })).status, 'completed');
++});
+diff --git a/scripts/automatic-reset-dom-check.mjs b/scripts/automatic-reset-dom-check.mjs
+new file mode 100644
+index 0000000..921b65c
+--- /dev/null
++++ b/scripts/automatic-reset-dom-check.mjs
+@@ -0,0 +1,118 @@
++// Actual client + Worker + SQLite; DOM/media adapters are NOT real-browser/NT8 acceptance.
++import assert from 'node:assert/strict';
++import { DatabaseSync } from 'node:sqlite';
++import { readFileSync, readdirSync } from 'node:fs';
++import { registerHooks } from 'node:module';
++const root = new URL('../', import.meta.url);
++registerHooks({
++  resolve(specifier, context, next) { return next(specifier.startsWith('/js/') ? new URL('public' + specifier, root).href : specifier, context); },
++  load(url, context, next) { return url.endsWith('.json') ? {format:'module',source:'export default ' + readFileSync(new URL(url),'utf8'),shortCircuit:true} : next(url,context); }
++});
++const {parseHTML} = await import(process.env.ZK_TEST_DOM_MODULE || 'linkedom');
++const {window, document} = parseHTML(readFileSync(new URL('public/app/index.html',root),'utf8'));
++let stamp = Date.now(), mono = 0, nextTimer = 0;
++const raf = new Map(), intervals = new Map(), timeouts = new Map();
++const address = new URL('https://offline.invalid/app/');
++Object.assign(globalThis, {
++  window, document, location: address,
++  history: {replaceState(_a,_b,url) { address.href = new URL(url,address).href; }},
++  Image: class { set src(v) { this._src=v; } get src() { return this._src; } },
++  localStorage: {getItem(key) { return key === 'zonekeeper-voice' ? 'off' : null; }, setItem() {}, removeItem() {}},
++  requestAnimationFrame: fn => { const id=++nextTimer; raf.set(id,fn); return id; },
++  cancelAnimationFrame: id => raf.delete(id)
++});
++Object.defineProperty(globalThis,'navigator',{value:{},configurable:true});
++Object.defineProperty(globalThis,'performance',{value:{now:()=>mono},configurable:true});
++Date.now = () => stamp;
++globalThis.setInterval = (fn,ms) => { const id=++nextTimer; intervals.set(id,{fn,ms,next:mono+ms}); return id; };
++globalThis.clearInterval = id => intervals.delete(id);
++globalThis.setTimeout = (fn,ms) => { const id=++nextTimer; timeouts.set(id,{fn,next:mono+ms}); return id; };
++globalThis.clearTimeout = id => timeouts.delete(id);
++window.HTMLElement.prototype.focus = function() {};
++window.HTMLElement.prototype.getBoundingClientRect = () => ({top:0,width:100,height:20});
++window.HTMLElement.prototype.getClientRects = () => [{}];
++const audio = document.getElementById('audio-b');
++for (const player of document.querySelectorAll('audio')) Object.assign(player,{currentTime:0,duration:153.09,paused:true,ended:false,seeking:false,playbackRate:1,
++  play:async function() { this.paused=false; this.ended=false; }, pause() { this.paused=true; }});
++const db = new DatabaseSync(':memory:');
++for (const f of readdirSync(new URL('migrations/',root)).filter(f=>f.endsWith('.sql')).sort()) db.exec(readFileSync(new URL('migrations/'+f,root),'utf8'));
++const DB = {
++  prepare(sql) { return {bind(...args) { return {
++    first: async () => db.prepare(sql).get(...args) || null,
++    all: async () => ({results:db.prepare(sql).all(...args)}),
++    run: async () => { const s=db.prepare(sql); return s.columns().length ? {results:s.all(...args)} : {meta:{changes:Number(s.run(...args).changes)}}; }
++  }; }}; },
++  async batch(stmts) { db.exec('BEGIN'); try { const out=[]; for(const s of stmts) out.push(await s.run()); db.exec('COMMIT'); return out; } catch(e) { db.exec('ROLLBACK'); throw e; } }
++};
++const env = {DB,SITE_URL:address.origin,SESSION_SECRET:'offline-test-only',ACCESS_MODE:'open'};
++const {default:worker} = await import('../worker.js');
++const {hmac} = await import('../src/auth.js');
++db.prepare('INSERT INTO users(id,email,status,comp_until,created_at) VALUES(1,?,?,?,1)').run('dom@offline.invalid','active',Math.floor(stamp/1000)+10000);
++db.prepare('INSERT INTO sessions(id,user_id,created_at,expires_at) VALUES(?,1,1,?)').run(await hmac(env,'dom-session'),Math.floor(stamp/1000)+10000);
++const token = 'zkd_'+'d'.repeat(43);
++db.prepare('INSERT INTO devices(id,user_id,name,token_hash,created_at) VALUES(1,1,?,?,1)').run('DOM',await hmac(env,'device:'+token));
++let failStart=false, failProgress=false;
++const calls=[];
++globalThis.fetch = async (path,options={}) => {
++  const url=new URL(path,address); assert.equal(url.origin,address.origin,'external network forbidden');
++  const headers=new Headers(options.headers); headers.set('Origin',address.origin); headers.set('Cookie','zk_session=dom-session');
++  calls.push(url.pathname);
++  if ((failStart && url.pathname==='/api/resets/start') || (failProgress && url.pathname==='/api/resets/progress')) throw Error('offline injected');
++  return worker.fetch(new Request(url,{...options,headers}),env);
++};
++async function device(path,body) {
++  return (await worker.fetch(new Request(address.origin+path,{method:body?'POST':'GET',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined}),env)).json();
++}
++const trade={account:'Sim101',instrument:'MNQ',side:'long',qty:1,entry_time:stamp-120000,exit_time:stamp-60000,entry_price:100,exit_price:101,pnl_cents:-200,commission_cents:0,currency:'USD',point_value:2,exit_exec_id:'dom1',local_date:new Date(stamp).toISOString().slice(0,10)};
++const upload=await device('/api/nt/trades',{trades:[trade],auto_reset:true});
++const tid=upload.accepted[0].trade_id;
++const handoff=await device('/api/nt/resets/open',{trade_id:tid}); address.hash=new URL(handoff.url).hash;
++const {store,getJson}=await import('../public/app/js/api.js'); store.me=await getJson('/api/me'); assert.equal(store.me.nt_addon,false);
++const {initReset,initAutomaticReset,openPicker}=await import('../public/app/js/reset.js');
++const {beforeDone}=await import('../public/app/js/steps.js');
++const $=id=>document.getElementById(id);
++const flush=async()=>{for(let i=0;i<20;i++) await new Promise(resolve=>setImmediate(resolve));};
++const click=node=>{assert.ok(node,'click target exists'); assert.equal(node.disabled===true,false,'click target enabled'); node.click();};
++const entries=()=>db.prepare('SELECT count(*) n FROM entries WHERE trade_id=?').get(tid).n;
++const pending=()=>db.prepare('SELECT completed_at FROM automatic_resets WHERE trade_id=?').get(tid).completed_at===null;
++function choose() {
++  click($('pick-triggers').querySelector('button'));
++  click($('automatic-before').querySelectorAll('button')[5]);
++  click($('pick-thoughts').querySelector('button'));
++  click($('pick-logic').querySelector('button'));
++}
++async function advance(seconds) {
++  for(let step=0;step<Math.ceil(seconds*10);step++) {
++    const delta=Math.min(.1,seconds-step*.1); if(delta<=0) break;
++    mono+=delta*1000; stamp+=delta*1000;
++    if(!audio.paused) {
++      audio.currentTime=Math.min(audio.duration,audio.currentTime+delta);
++      if(audio.currentTime>=audio.duration-.00001) { audio.currentTime=audio.duration; audio.ended=true; audio.paused=true; }
++    }
++    for(const [id,t] of [...timeouts]) if(t.next<=mono) { timeouts.delete(id); t.fn(); }
++    for(const t of intervals.values()) if(t.next<=mono) { t.next+=t.ms; t.fn(); }
++    const frames=[...raf.values()]; raf.clear(); for(const fn of frames) fn();
++    await Promise.resolve();
++  }
++  await flush();
++}
++initReset(); initAutomaticReset(); await flush();
++assert.equal($('picker').hidden,false); assert.equal(store.trades[0].reset_status,'pending'); assert.equal($('pick-log').hidden,true);
++choose(); click($('pick-play')); await flush();
++assert.ok(calls.includes('/api/resets/start'),'handoff with nt_addon=false must still start automatic proof');
++assert.equal($('run-skip').hidden,true); assert.equal(entries(),0);
++await advance(10); click($('run-stop')); await flush(); assert.equal(entries(),0); assert.equal(pending(),true);
++assert.equal(document.querySelector('.js-voice').textContent,'Voice: off','automatic playback restores manual voice preference');
++// Stopping permits ordinary manual mode while retaining an explicit pending resume button.
++beforeDone(4,new Date(stamp).toISOString().slice(0,16)); openPicker(); assert.equal($('pick-log').hidden,false); click($('pick-close'));
++click($('automatic-reset-status').querySelector('button')); choose(); failStart=true; click($('pick-play')); await flush();
++assert.equal(pending(),true); assert.equal(entries(),0); assert.match($('run-auto-status').textContent,/could not start/i);
++click($('run-stop')); failStart=false; click($('automatic-reset-status').querySelector('button')); choose(); click($('pick-play')); await flush();
++failProgress=true; await advance(audio.duration+1);
++assert.equal(pending(),true); assert.equal(entries(),0); assert.equal($('run-auto-confirm').hidden,false);
++failProgress=false; click($('run-auto-confirm')); await flush();
++assert.equal($('run-rate').hidden,false); assert.equal(entries(),0); assert.equal(pending(),true);
++click($('run-tilt').querySelectorAll('button')[2]); await flush(); assert.equal(entries(),0);
++click($('run-done')); await flush(); assert.equal(pending(),false); assert.equal(entries(),1); assert.equal($('run').hidden,true);
++assert.equal(store.trades.find(t=>t.id===tid).reset_status,'completed');
++console.log('PASS client + Worker + SQLite DOM adapter: flag off, Stop, manual reopening, resume, failed start/progress, final tilt and Done. NOT real-browser/media/NT8 acceptance.');
+diff --git a/scripts/automatic-resets-api-check.mjs b/scripts/automatic-resets-api-check.mjs
+new file mode 100644
+index 0000000..34db40f
+--- /dev/null
++++ b/scripts/automatic-resets-api-check.mjs
+@@ -0,0 +1,159 @@
++import assert from 'node:assert/strict';
++import { DatabaseSync } from 'node:sqlite';
++import { readFileSync, readdirSync } from 'node:fs';
++import { registerHooks } from 'node:module';
++registerHooks({load(url,context,next){if(url.endsWith('.json'))return {format:'module',source:'export default '+readFileSync(new URL(url),'utf8'),shortCircuit:true};return next(url,context);}});
++const {default:worker}=await import('../worker.js');
++const {hmac}=await import('../src/auth.js');
++// No networking, mail, billing or deployed database can be touched by this test.
++globalThis.fetch=async()=>{throw Error('network forbidden in offline test');};
++let stamp=Date.now(); Date.now=()=>stamp;
++const db=new DatabaseSync(':memory:');
++for(const f of readdirSync(new URL('../migrations/',import.meta.url)).filter(f=>f.endsWith('.sql')).sort())db.exec(readFileSync(new URL('../migrations/'+f,import.meta.url),'utf8'));
++let failEnqueue=false, failComplete=false, replaceAttemptBeforeBatch=null;
++const DB = {
++  prepare(sql) {
++    return { bind(...args) {
++      return {
++        first: async () => db.prepare(sql).get(...args) || null,
++        all: async () => ({results: db.prepare(sql).all(...args)}),
++        run: async () => {
++          if (failEnqueue && sql.includes('INSERT INTO automatic_resets')) throw Error('injected enqueue failure');
++          if (failComplete && sql.includes('UPDATE automatic_resets SET completed_at')) throw Error('injected completion failure');
++          const stmt = db.prepare(sql);
++          return stmt.columns().length ? {results: stmt.all(...args)} : {meta: {changes: Number(stmt.run(...args).changes)}};
++        }
++      };
++    } };
++  },
++  async batch(stmts) {
++    if (replaceAttemptBeforeBatch) { db.prepare('UPDATE automatic_resets SET attempt_id=? WHERE trade_id=?').run('racing_restart', replaceAttemptBeforeBatch); replaceAttemptBeforeBatch=null; }
++    db.exec('BEGIN');
++    try { const out = []; for (const s of stmts) out.push(await s.run()); db.exec('COMMIT'); return out; }
++    catch(e) { db.exec('ROLLBACK'); throw e; }
++  }
++};
++const env={DB,SITE_URL:'https://offline.invalid',SESSION_SECRET:'test-only-secret',ACCESS_MODE:'open'};
++for(let uid=1;uid<=2;uid++){
++ db.prepare('INSERT INTO users(id,email,status,comp_until,created_at) VALUES(?,?,?,?,?)').run(uid,`u${uid}@offline.invalid`,'active',Math.floor(stamp/1000)+10000,1);
++ db.prepare('INSERT INTO sessions(id,user_id,created_at,expires_at) VALUES(?,?,?,?)').run(await hmac(env,`session${uid}`),uid,1,Math.floor(stamp/1000)+10000);
++}
++const deviceToken='zkd_'+'a'.repeat(43);
++db.prepare('INSERT INTO devices(id,user_id,name,token_hash,created_at) VALUES(1,1,?,?,1)').run('PC',await hmac(env,'device:'+deviceToken));
++async function call(path,body,options={}){
++ const headers={'Content-Type':'application/json',Origin:env.SITE_URL};
++ if(options.device)headers.Authorization='Bearer '+deviceToken;else if(options.uid!==0)headers.Cookie=`zk_session=session${options.uid||1}`;
++ if(options.origin)headers.Origin=options.origin;
++ const request=new Request(env.SITE_URL+path,{method:body?'POST':'GET',headers,body:body?JSON.stringify(body):undefined});
++ const response=await worker.fetch(request,env);const text=await response.text();let data;try{data=JSON.parse(text);}catch{data=text;}return{status:response.status,data};
++}
++const trade={account:'Sim101',instrument:'MNQ',side:'long',qty:1,entry_time:stamp-120000,exit_time:stamp-60000,entry_price:100,exit_price:101,pnl_cents:200,commission_cents:0,currency:'USD',point_value:2,exit_exec_id:'exec1',local_date:new Date(stamp).toISOString().slice(0,10)};
++let r=await call('/api/nt/trades',{trades:[trade,{},trade],auto_reset:true},{device:true});
++assert.equal(r.status,200,JSON.stringify(r));assert.equal(r.data.inserted,1);assert.equal(r.data.duplicates,1);assert.deepEqual(r.data.accepted.map(x=>x.index),[0,2]);assert.equal(r.data.rejected[0].index,1);
++const tid=r.data.accepted[0].trade_id;
++assert.equal(db.prepare('SELECT count(*) n FROM automatic_resets').get().n,1);
++assert.equal((await call('/api/nt/trades',{trades:[trade],auto_reset:true},{device:true})).data.accepted[0].trade_id,tid);
++assert.equal((await call('/api/nt/resets',undefined,{device:true})).data.pending.length,1);
++assert.equal((await call('/api/nt/resets')).status,401);
++assert.equal((await call('/api/resets/start',{trade_id:tid,audio_id:'b1'},{uid:0})).status,401);
++assert.equal((await call('/api/resets/start',{trade_id:tid,audio_id:'b1'},{origin:'https://evil.invalid'})).status,403);
++assert.equal((await call('/api/resets/start',{trade_id:tid,audio_id:'b1'},{uid:2})).status,400);
++const open=await call('/api/nt/resets/open',{trade_id:tid},{device:true});
++assert.ok(open.data.expires_at>stamp);
++const handoff=open.data.url.split('=')[1];
++assert.equal((await call('/api/resets/open',{handoff},{uid:2})).status,400);
++db.exec('UPDATE users SET comp_until=0,current_period_end=0 WHERE id=1');
++assert.equal((await call('/api/resets/open',{handoff})).status,403);
++db.prepare('UPDATE users SET comp_until=? WHERE id=1').run(Math.floor(stamp/1000)+10000);
++assert.equal((await call('/api/resets/open',{handoff})).data.trade.id,tid);
++assert.equal((await call('/api/resets/open',{handoff})).status,400);
++let started=(await call('/api/resets/start',{trade_id:tid,audio_id:'b1'})).data;
++const entry={kind:'after_trade',trigger:'stop_loss',thought:'make_it_back',audio_id:'b1',local:new Date(stamp).toISOString().slice(0,16),tilt_before:7,tilt_after:3};
++const completion={trade_id:tid,attempt_id:started.attempt_id,done:true,entry};
++assert.equal((await call('/api/resets/complete',completion)).status,400);
++assert.equal((await call('/api/resets/progress',{trade_id:tid,attempt_id:started.attempt_id,position_seconds:started.duration_seconds})).status,400);
++stamp+=started.duration_seconds*1000;
++assert.equal((await call('/api/resets/progress',{trade_id:tid,attempt_id:started.attempt_id,position_seconds:started.duration_seconds})).data.ready,true);
++r=await call('/api/resets/complete',completion);assert.equal(r.status,200,JSON.stringify(r));assert.equal(r.data.status,'completed');assert.equal(r.data.entry.trade_id,tid);assert.equal(r.data.entry.tilt_after,3);
++assert.equal((await call('/api/resets/complete',completion)).data.entry.id,r.data.entry.id);
++assert.equal((await call('/api/nt/resets',undefined,{device:true})).data.pending.length,0);
++assert.equal(db.prepare('SELECT count(*) n FROM entries').get().n,1);
++assert.equal(db.prepare('SELECT pnl_cents FROM trades WHERE id=?').get(tid).pnl_cents,200);
++const day=trade.local_date;
++assert.equal((await call(`/api/trades?from=${day}&to=${day}`)).data.trades[0].reset_status,'completed');
++// A durable trade with a failed enqueue must not ACK. Its retry creates the pending request.
++const second={...trade,exit_exec_id:'exec2'};failEnqueue=true;
++await assert.rejects(()=>call('/api/nt/trades',{trades:[second],auto_reset:true},{device:true}),/injected/);
++failEnqueue=false;
++r=await call('/api/nt/trades',{trades:[second],auto_reset:true},{device:true});assert.equal(r.data.duplicates,1);const secondId=r.data.accepted[0].trade_id;
++// A legacy manually linked entry resumes without duplicating or changing trade metadata.
++const manual=await call('/api/entries',{...entry,trade_id:secondId,setup_grade:'A',pnl_cents:999,request_id:'manual_entry_2'});assert.equal(manual.status,200,JSON.stringify(manual));
++started=(await call('/api/resets/start',{trade_id:secondId,audio_id:'b1'})).data;
++stamp+=started.duration_seconds*1000;
++await call('/api/resets/progress',{trade_id:secondId,attempt_id:started.attempt_id,position_seconds:started.duration_seconds});
++r=await call('/api/resets/complete',{trade_id:secondId,attempt_id:started.attempt_id,done:true,entry:{...entry,tilt_after:1}});
++assert.equal(r.status,200,JSON.stringify(r));assert.equal(r.data.entry.id,manual.data.entry.id);assert.equal(r.data.entry.tilt_after,1);assert.equal(r.data.entry.pnl_cents,999);assert.equal(r.data.entry.setup_grade,'A');
++// Opt-out clients retain their exact response shape and create no automatic requests.
++r=await call('/api/nt/trades',{trades:[{...trade,exit_exec_id:'legacy'}]},{device:true});
++assert.equal('accepted' in r.data,false);
++assert.equal(db.prepare('SELECT count(*) n FROM automatic_resets').get().n,2);
++r=await call('/api/nt/trades',{trades:[{}],auto_reset:true},{device:true});assert.deepEqual(r.data.accepted,[]);
++// Pending pagination is ascending, bounded and independent of entry links.
++const template=db.prepare('SELECT * FROM trades WHERE id=?').get(tid);
++for(let i=0;i<102;i++){
++ const inserted=db.prepare(`INSERT INTO trades(user_id,device_id,account,instrument,side,qty,entry_time,exit_time,entry_price,exit_price,pnl_cents,currency,point_value,exit_exec_id,local_date,created_at)
++ VALUES(1,1,'Page','MNQ','long',1,1,2,1,2,100,'USD',2,?,'2026-10-16',1) RETURNING id`).get('page'+i);
++ db.prepare('INSERT INTO automatic_resets(user_id,trade_id,created_at) VALUES(1,?,1)').run(inserted.id);
++}
++const page1=(await call('/api/nt/resets',undefined,{device:true})).data;
++assert.equal(page1.pending.length,100);assert.equal(page1.next_cursor,page1.pending.at(-1).trade_id);
++const page2=(await call('/api/nt/resets?after='+page1.next_cursor,undefined,{device:true})).data;
++assert.equal(page2.pending.length,2);assert.equal(page2.next_cursor,0);assert.ok(page2.pending[0].trade_id>page1.next_cursor);
++// A fresh playback attempt invalidates the old tab, and interrupted attempts stay pending.
++const pendingId=page2.pending[0].trade_id;
++const old=(await call('/api/resets/start',{trade_id:pendingId,audio_id:'b1'})).data;
++const replacement=(await call('/api/resets/start',{trade_id:pendingId,audio_id:'b1'})).data;
++stamp+=200000;
++assert.equal((await call('/api/resets/progress',{trade_id:pendingId,attempt_id:old.attempt_id,position_seconds:153})).status,400);
++assert.equal((await call('/api/resets/complete',{trade_id:pendingId,attempt_id:replacement.attempt_id,done:true,entry})).status,400);
++assert.equal(db.prepare('SELECT completed_at FROM automatic_resets WHERE trade_id=?').get(pendingId).completed_at,null);
++// Completing entry + request is atomic: interruption rolls back both; retry remains safe.
++await call('/api/resets/progress',{trade_id:pendingId,attempt_id:replacement.attempt_id,position_seconds:153});
++const retryBody={trade_id:pendingId,attempt_id:replacement.attempt_id,done:true,entry};
++failComplete=true;
++await assert.rejects(()=>call('/api/resets/complete',retryBody),/injected completion/);
++failComplete=false;
++assert.equal(db.prepare('SELECT count(*) n FROM entries WHERE trade_id=?').get(pendingId).n,0);
++assert.equal(db.prepare('SELECT completed_at FROM automatic_resets WHERE trade_id=?').get(pendingId).completed_at,null);
++// A restart between validation and transaction cannot insert an entry or finish the stale attempt.
++replaceAttemptBeforeBatch=pendingId;
++assert.equal((await call('/api/resets/complete',retryBody)).status,400);
++assert.equal(db.prepare('SELECT count(*) n FROM entries WHERE trade_id=?').get(pendingId).n,0);
++assert.equal(db.prepare('SELECT completed_at FROM automatic_resets WHERE trade_id=?').get(pendingId).completed_at,null);
++const last=(await call('/api/resets/start',{trade_id:pendingId,audio_id:'b1'})).data;
++stamp+=153000;
++await call('/api/resets/progress',{trade_id:pendingId,attempt_id:last.attempt_id,position_seconds:153});
++assert.equal((await call('/api/resets/complete',{...retryBody,attempt_id:last.attempt_id})).status,200);
++// Explicit grade/rules edits on an existing linked entry are honored; P/L stays unchanged.
++const gradeId=page2.pending[1].trade_id;
++const gradeManual=await call('/api/entries',{...entry,trade_id:gradeId,setup_grade:'A',rules_kept:true,pnl_cents:321});
++assert.equal(gradeManual.status,200,JSON.stringify(gradeManual));
++const gradeAttempt=(await call('/api/resets/start',{trade_id:gradeId,audio_id:'b1'})).data;
++stamp+=153000;
++await call('/api/resets/progress',{trade_id:gradeId,attempt_id:gradeAttempt.attempt_id,position_seconds:153});
++const gradeDone=await call('/api/resets/complete',{trade_id:gradeId,attempt_id:gradeAttempt.attempt_id,done:true,entry:{...entry,setup_grade:'B',rules_kept:false,pnl_cents:123}});
++assert.equal(gradeDone.status,200,JSON.stringify(gradeDone));assert.equal(gradeDone.data.entry.setup_grade,'B');assert.equal(gradeDone.data.entry.rules_kept,0);assert.equal(gradeDone.data.entry.pnl_cents,321);
++// Reset traffic must not share the independent trade-upload quota.
++const usageHour=Math.floor(stamp/1000/3600);
++db.prepare('UPDATE api_usage SET nt=600 WHERE user_id=1 AND hour=?').run(usageHour);
++assert.equal((await call('/api/nt/resets',undefined,{device:true})).status,200);
++db.prepare('UPDATE api_usage SET nt=0,reset_calls=3599 WHERE user_id=1 AND hour=?').run(usageHour);
++assert.equal((await call('/api/nt/resets',undefined,{device:true})).status,200);
++assert.equal((await call('/api/nt/resets',undefined,{device:true})).status,429);
++assert.equal((await call('/api/resets/start',{trade_id:tid,audio_id:'b1'})).status,429);
++assert.equal((await call('/api/nt/trades',{trades:[trade],auto_reset:true},{device:true})).status,200);
++// Five PCs at 15-second intervals cost 1200/hour, leaving ample playback and handoff budget.
++db.prepare('UPDATE api_usage SET reset_calls=1200,writes=200,polls=600 WHERE user_id=1 AND hour=?').run(usageHour);
++assert.equal((await call('/api/nt/resets',undefined,{device:true})).status,200);
++assert.equal((await call('/api/resets/start',{trade_id:page1.pending[0].trade_id,audio_id:'b1'})).status,200);
++console.log('PASS offline worker + real SQLite: upload mapping/durable retry, cookie/device/member/paid/origin gates, handoffs, full playback, completion retry and existing entry preservation');
+diff --git a/scripts/automatic-resets-check.mjs b/scripts/automatic-resets-check.mjs
+new file mode 100644
+index 0000000..8705c34
+--- /dev/null
++++ b/scripts/automatic-resets-check.mjs
+@@ -0,0 +1,38 @@
++import assert from 'node:assert/strict';
++import { DatabaseSync } from 'node:sqlite';
++import { readdirSync, readFileSync } from 'node:fs';
++const { automaticResets } = await import('../src/automatic-resets.js');
++const db = new DatabaseSync(':memory:');
++for (const f of readdirSync(new URL('../migrations/', import.meta.url)).filter(f => f.endsWith('.sql')).sort()) db.exec(readFileSync(new URL('../migrations/' + f, import.meta.url), 'utf8'));
++const DB = { prepare(sql) { return { bind(...args) { return { first: async () => db.prepare(sql).get(...args) || null, all: async () => ({ results: db.prepare(sql).all(...args) }), run: async () => ({ meta: { changes: Number(db.prepare(sql).run(...args).changes) } }) }; } }; }, async batch(stmts) { db.exec('BEGIN'); try { const out = []; for (const s of stmts) out.push(await s.run()); db.exec('COMMIT'); return out; } catch(e) { db.exec('ROLLBACK'); throw e; } } };
++db.exec("INSERT INTO users(id,email,status,created_at) VALUES(1,'one@test.invalid','active',1),(2,'two@test.invalid','active',1); INSERT INTO devices(id,user_id,name,token_hash,created_at) VALUES(1,1,'PC','device',1)");
++const trade = db.prepare(`INSERT INTO trades(user_id,device_id,account,instrument,side,qty,entry_time,exit_time,entry_price,exit_price,pnl_cents,currency,point_value,exit_exec_id,local_date,created_at) VALUES(1,1,'Sim101','MNQ','long',1,1,2,100,101,200,'USD',2,'exit','2026-10-16',1) RETURNING *`).get();
++let clock = 1000, serial = 0;
++const api = automaticResets({ audios: {b:{seconds:10}}, now:()=>clock, token:()=>`opaque_token_${++serial}`, hash:async(_,s)=>s, bad:s=>new Error(s), prepareEntry: async()=>{ throw Error('not used'); } });
++const ctx = {env:{DB},user:{id:1},device:{id:1},url:new URL('https://example.test/api/nt/resets')};
++await api.enqueue(ctx, trade.id); await api.enqueue(ctx, trade.id);
++assert.equal(db.prepare('SELECT count(*) n FROM automatic_resets').get().n,1);
++assert.equal((await (await api.pending(ctx)).json()).pending[0].trade_id,trade.id);
++assert.equal((await (await api.pending({...ctx,user:{id:2}})).json()).pending.length,0);
++const link = await (await api.deviceOpen({...ctx,body:{trade_id:trade.id}})).json();
++assert.ok(link.url.startsWith('https://example.test/app/#nt-reset='));
++const handoff = decodeURIComponent(link.url.split('=')[1]);
++await assert.rejects(()=>api.open({...ctx,user:{id:2},body:{handoff}}),/handoff/);
++assert.equal((await (await api.open({...ctx,body:{handoff}})).json()).trade.id,trade.id);
++await assert.rejects(()=>api.open({...ctx,body:{handoff}}),/handoff/);
++const start = await (await api.start({...ctx,body:{trade_id:trade.id,audio_id:'b'}})).json();
++await assert.rejects(()=>api.progress({...ctx,body:{trade_id:trade.id,attempt_id:start.attempt_id,position_seconds:10}}),/playback/);
++clock+=5;
++assert.equal((await (await api.progress({...ctx,body:{trade_id:trade.id,attempt_id:start.attempt_id,position_seconds:5}})).json()).ready,false);
++clock+=5;
++assert.equal((await (await api.progress({...ctx,body:{trade_id:trade.id,attempt_id:start.attempt_id,position_seconds:10}})).json()).ready,true);
++await assert.rejects(()=>api.complete({...ctx,body:{trade_id:trade.id,attempt_id:'stale',done:true,entry:{tilt_after:2}}}),/attempt/);
++await assert.rejects(()=>api.complete({...ctx,body:{trade_id:trade.id,attempt_id:start.attempt_id,entry:{tilt_after:2}}}),/Done/);
++const revoked = await (await api.deviceOpen({...ctx,body:{trade_id:trade.id}})).json();
++db.exec('UPDATE devices SET revoked_at=1001 WHERE id=1');
++await assert.rejects(()=>api.open({...ctx,body:{handoff:revoked.url.split('=')[1]}}),/handoff/);
++db.exec('UPDATE devices SET revoked_at=NULL WHERE id=1');
++const expiring = await (await api.deviceOpen({...ctx,body:{trade_id:trade.id}})).json();
++clock += 301;
++await assert.rejects(()=>api.open({...ctx,body:{handoff:expiring.url.split('=')[1]}}),/handoff/);
++console.log('PASS automatic resets: durable enqueue, member isolation, one-use handoff, revocation, playback and completion gates');
+diff --git a/scripts/journal-check.mjs b/scripts/journal-check.mjs
+index b4e5d89..8a1ad30 100644
+--- a/scripts/journal-check.mjs
++++ b/scripts/journal-check.mjs
+@@ -113,16 +113,16 @@ export function journalChecks(check) {
+     entry(null, 5000, { kind: 'tilt', tilt_after: 3 })];
+   const ntManualDay = dayMap(manualEntries, [], [], [], ntRows).get(date);
+   const ntManual = dayTotals(ntManualDay);
+-  check('dayTotals: NT + unlinked original typed P/L (0 counts); linked edited P/L, untyped, missed, repeat and tilt never add',
+-    ntManual.trades === 5 && ntManual.pnlCents === -13550 && ntManual.fromNt && ntManual.ntPnlCents === -12050
+-    && ntManual.autoTrades === 5 && ntManual.pnlTyped === 4);
++  check('dayTotals: NT + every unlinked original trade; only typed P/L adds money; linked, missed, repeat and tilt never add',
++    ntManual.trades === 6 && ntManual.pnlCents === -13550 && ntManual.fromNt && ntManual.ntPnlCents === -12050
++    && ntManual.autoTrades === 3 && ntManual.pnlTyped === 2);
+   const ntSaved = (trades, pnl) => dayMap(manualEntries, [], [{ local_date: date, trades, pnl_cents: pnl }], [], ntRows).get(date);
+   const ntBoth = dayTotals(ntSaved(9, 10000)), ntCount = dayTotals(ntSaved(9, null)), ntPnl = dayTotals(ntSaved(null, 10000));
+   check('dayTotals: each saved field wins over NT + manual; an empty field stays auto, including partial edits; empty both restores auto',
+     ntBoth.trades === 9 && ntBoth.pnlCents === 10000 && !ntBoth.fromNt
+     && ntCount.trades === 9 && ntCount.pnlCents === -13550 && ntCount.fromNt
+-    && ntPnl.trades === 5 && ntPnl.pnlCents === 10000 && ntPnl.fromNt
+-    && dayTotals(ntSaved(null, null)).trades === 5 && dayTotals(ntSaved(null, null)).pnlCents === -13550
++    && ntPnl.trades === 6 && ntPnl.pnlCents === 10000 && ntPnl.fromNt
++    && dayTotals(ntSaved(null, null)).trades === 6 && dayTotals(ntSaved(null, null)).pnlCents === -13550
+     && dayTotals(ntSaved(0, 0)).trades === 0 && dayTotals(ntSaved(0, 0)).pnlCents === 0);
+   const ntNextDay = dayMap([late], [], [], [], [ntTrade(5, 5000, 1000, { local_date: '2026-09-15' })]).get('2026-09-15');
+   check('dayTotals: a reset shown on its next tilt-sample day adds manual P/L only on its original local_date',
+@@ -132,7 +132,7 @@ export function journalChecks(check) {
+     dayMoney(ntDay).join(' · ') === '3 trades · P/L −120.50 (NinjaTrader)'
+     && dayMoney(mixedDay).join(' · ') === '3 trades · P/L −120.50 (NinjaTrader, 2 currencies)'
+     && dayMoney(ntSaved(9, null)).join(' · ') === '9 trades (edited) · P/L −135.50 (NinjaTrader)'
+-    && dayMoney(ntSaved(null, 10000)).join(' · ') === '5 trades · P/L +100 (edited)');
++    && dayMoney(ntSaved(null, 10000)).join(' · ') === '6 trades · P/L +100 (edited)');
+   check('trades.js: tradeLine "ES 12-26 · Long 1 · −62.50"; Short 2; CAD "+25 CAD"; zero "0"; loss/win/flat triggers',
+     tradeLine(ntRows[2]) === 'ES 12-26 · Long 1 · −62.50' && sideText({ side: 'short', qty: 2 }) === 'Short 2'
+     && amountText({ pnl_cents: 2500, currency: 'CAD' }) === '+25 CAD' && amountText({ pnl_cents: 0, currency: 'USD' }) === '0'
+diff --git a/scripts/reset-totals-check.mjs b/scripts/reset-totals-check.mjs
+new file mode 100644
+index 0000000..fcc5611
+--- /dev/null
++++ b/scripts/reset-totals-check.mjs
+@@ -0,0 +1,101 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import { dayMap, dayTotals, monthStats, weekSummary } from '../public/js/stats.js';
++import { dayPnlGeometry } from '../public/js/day-pnl-chart.js';
++import { weekMoney, pnlMailLine } from '../src/cron.js';
++const date = '2026-10-05';
++const trade = { id: 1, local_date: date, exit_time: Date.parse(`${date}T15:30:00Z`), pnl_cents: -2500, currency: 'USD', instrument: 'ES' };
++const log = { id: 2, ts: 1, kind: 'after_trade', trigger: 'stop_loss', again: 0, local_date: date, local_hour: 12, pnl_cents: -2500 };
++const totals = (entries, trades = [trade], summaries = []) => dayTotals(dayMap(entries, [], summaries, [], trades).get(date));
++test('imports count before and after linked reset, including a reset logged on another day', () => {
++ for (const e of [[], [{ ...log, trade_id: 1 }], [{ ...log, trade_id: 1, local_date: '2026-10-06' }]]) {
++  assert.equal(totals(e).trades, 1); assert.equal(totals(e).pnlCents, -2500);
++  assert.equal(monthStats(e, [], '2026-10', [], [trade]).trades, 1);
++  assert.equal(monthStats(e, [], '2026-10', [], [trade]).pnlCents, -2500);
++ }
++});
++test('unlinked manual logs remain counted with and without typed P/L', () => {
++ assert.equal(totals([log, { ...log, id: 3, pnl_cents: null }]).trades, 3);
++ assert.equal(totals([log, { ...log, id: 3, pnl_cents: null }]).pnlCents, -5000);
++});
++test('chart imports are independent of resets; midnight reset never adds a second point', () => {
++ const before = dayPnlGeometry([], date, null, [trade]);
++ const after = dayPnlGeometry([{ ...log, trade_id: 1 }], date, null, [trade]);
++ assert.equal(before?.totalCents, -2500); assert.equal(after?.totalCents, -2500);
++ assert.equal(after.points.length, 1);
++ assert.equal(dayPnlGeometry([{ ...log, trade_id: 1, local_date: '2026-10-06' }], '2026-10-06'), null);
++});
++test('weekly trade-only eligibility and manual daily overrides', () => {
++ assert.equal(weekSummary([], [], date, [trade]).hasData, true);
++ assert.equal(weekMoney([], [], [trade]).pnl, -2500);
++ const saved = [{ local_date: date, trades: 7, pnl_cents: 12300, currency: 'CAD' }];
++ assert.equal(weekMoney([], saved, [trade]).pnl, 12300);
++ assert.equal(monthStats([], [], '2026-10', [], [trade], saved).trades, 7);
++});
++test('mixed currencies stay explicit in chart and weekly mail, even across different days', () => {
++ const cad = { ...trade, id: 4, currency: 'CAD', pnl_cents: 1000 };
++ assert.equal(dayPnlGeometry([], date, null, [trade, cad])?.mixedCurrency, true);
++ const money = weekMoney([], [], [trade, { ...cad, local_date: '2026-10-06' }]);
++ assert.equal(money.mixedCurrency, true); assert.match(pnlMailLine(money), /USD.*CAD|CAD.*USD/);
++});
++
++test('chart follows the trade list browser clock and flags calendar-date timezone differences', () => {
++ const exit = new Date(2026, 9, 6, 0, 15).getTime();
++ const g = dayPnlGeometry([], date, null, [{ ...trade, exit_time: exit }]);
++ assert.equal(g.points[0].minutes, 15);
++ assert.equal(g.points[0].browserDate, '2026-10-06');
++ assert.equal(g.dateMismatch, true);
++ assert.equal(g.totalCents, -2500);
++});
++
++test('real weekly SQL: trade-only mail, linked-reset invariance, untyped logs, overrides and member isolation', async () => {
++ const { DatabaseSync } = await import('node:sqlite');
++ const { readdirSync, readFileSync } = await import('node:fs');
++ const { buildMails } = await import('../src/cron.js');
++ const db = new DatabaseSync(':memory:');
++ try {
++  const dir = new URL('../migrations/', import.meta.url);
++  for (const file of readdirSync(dir).filter((f) => f.endsWith('.sql')).sort()) db.exec(readFileSync(new URL(file, dir), 'utf8'));
++  db.exec("INSERT INTO users (id,email,status,created_at) VALUES (1,'one@example.test','active',1),(2,'two@example.test','active',1)");
++  const insert = db.prepare(`INSERT INTO trades (user_id,account,instrument,side,qty,entry_time,exit_time,entry_price,exit_price,pnl_cents,currency,point_value,exit_exec_id,local_date,created_at)
++   VALUES (?, 'Sim', 'ES', 'long', 1, 1, 2, 100, 99, ?, ?, 50, ?, ?, 1)`);
++  insert.run(1, -2500, 'USD', 'one', date);
++  insert.run(2, 999900, 'USD', 'other-member', date);
++  insert.run(1, 999900, 'USD', 'outside-week', '2026-10-12');
++  const env = { SESSION_SECRET: 'local-only-test-secret', SITE_URL: 'https://example.test', DB: {
++   prepare(sql) { return { bind(...args) { return { sql, args }; } }; },
++   async batch(queries) { return queries.map(({sql,args}) => ({ results: db.prepare(sql).all(...args) })); }
++  }};
++  const users = [{id:1,email:'one@example.test'}];
++  const mail = async () => (await buildMails(env, users, '2026-10-12'))[0]?.text;
++  const before = await mail();
++  assert.match(before, /Trades: 1 .*P\/L: \u221225 USD \(1 of 1/);
++  const entry = db.prepare(`INSERT INTO entries (user_id,ts,kind,trigger,local_date,local_hour,request_id,tapped_at,again,trade_id,pnl_cents)
++    VALUES (1,1,'after_trade','stop_loss',?,12,?,1,0,?,?)`);
++  entry.run(date,'linked',1,-999900);
++  assert.equal((await mail()).split('\n').find((s)=>s.startsWith('Trades:')),before.split('\n').find((s)=>s.startsWith('Trades:')));
++  entry.run(date,'manual',null,null);
++  assert.match(await mail(), /Trades: 2 .*P\/L: \u221225 USD \(1 of 2/);
++  insert.run(1, 1000, 'CAD', 'cad-next-day', '2026-10-06');
++  assert.match(await mail(), /USD, CAD \(mixed currencies, no conversion\)/);
++  db.exec("INSERT INTO daily_summaries (user_id,local_date,trades,pnl_cents,currency,updated_at,tapped_at) VALUES (1,'2026-10-05',7,12300,'CAD',1,1)");
++  assert.match(await mail(), /Trades: 8 .*P\/L: \+133 CAD \(8 of 8/);
++ } finally { db.close(); }
++});
++
++test('chart renderer shows imported currency, timezone caveat and saved override without changing the curve', async () => {
++ const { renderDayPnlChart } = await import('../public/js/day-pnl-chart.js');
++ const node = () => ({ children: [], textContent: '', setAttribute() {}, append(...children) { this.children.push(...children); } });
++ const original = globalThis.document;
++ globalThis.document = { createElement: node, createElementNS: node };
++ try {
++  const box = node();
++  renderDayPnlChart(box, [{ ...log, trade_id: 1 }], date, { savedCents: 12300, savedCurrency: 'CAD', ntTrades: [trade,
++   { ...trade, id: 3, currency: 'CAD', exit_time: new Date(2026, 9, 6, 0, 15).getTime() }] });
++  const text = (n) => n.textContent + n.children.map(text).join('\n');
++  assert.match(text(box), /USD/); assert.match(text(box), /CAD/);
++  assert.match(text(box), /Mixed currencies; amounts are added without conversion/);
++  assert.match(text(box), /another date/);
++  assert.match(text(box), /Your saved day P\/L: \+123 CAD/);
++ } finally { if (original === undefined) delete globalThis.document; else globalThis.document = original; }
++});
+diff --git a/src/api.js b/src/api.js
+index dcf2b41..78435c3 100644
+--- a/src/api.js
++++ b/src/api.js
+@@ -19,6 +19,7 @@ import { validSetupGrade } from '../public/js/trade-grades.js';
+ import { dayMap } from '../public/js/stats.js';
+ import { csvTradeId } from '../public/js/nt-csv.js';
+ import { UPGRADE_IMPORTED_TRADE } from './trade-sql.js';
++import { automaticResets } from './automatic-resets.js';
+ import { CURRENCIES, MAX_PNL_CENTS, MAX_TRADES, parseLocalStamp, realDate } from '../public/js/daily.js';
+ import { getDevice, getUser, hmac, now, randomToken, tooManyTries } from './auth.js';
+ import { ensureAccess } from './stripe.js';
+@@ -39,7 +40,8 @@ const CODE_SIGNS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 32 signs: no 0/O, no 1
+ const CLAIM_TRIES_PER_HOUR = 10;   // per visitor (IP)
+ const MAX_TRADES_PER_CALL = 20;
+ const MAX_TRADES_PER_DAY = 2000;   // per member, saved in 24 hours (a broken add-on cannot fill D1)
+-const TRADE_COLUMNS = 'id, device_id, account, instrument, side, qty, entry_time, exit_time, entry_price, exit_price, pnl_cents, commission_cents, currency, point_value, exit_name, local_date, created_at';
++const TRADE_COLUMNS = `id, device_id, account, instrument, side, qty, entry_time, exit_time, entry_price, exit_price, pnl_cents, commission_cents, currency, point_value, exit_name, local_date, created_at,
++  (SELECT CASE WHEN r.completed_at IS NULL THEN 'pending' ELSE 'completed' END FROM automatic_resets r WHERE r.user_id=trades.user_id AND r.trade_id=trades.id) AS reset_status`;
+ // The step marks of each audio (/api/me), by the "steps" key of audios.json. Since 2026-10-13 the resets b1…b60 and
+ // the general B v3 are built from voice blocks: all their marks are in reset-marks.json. The old keys stay for going
+ // back ('b' = the old B, 'b-v2', b1…b9 = the first own resets).
+@@ -47,14 +49,20 @@ const MARKS = { b: B_MARKS, 'b-v2': B_V2_MARKS, b1: B1_MARKS, b2: B2_MARKS, b3:
+   b6: B6_MARKS, b7: B7_MARKS, b8: B8_MARKS, b9: B9_MARKS, ...RESET_MARKS };
+ // Calls per member per hour. A reset is about 5 writes (the entry, 2 tilts, 👍/👎, a note).
+ // nt = the NinjaTrader add-on's calls (all his PCs together).
+-const LIMITS = { reads: 300, writes: 200, nt: 600, polls: 600 };
++const LIMITS = { reads: 300, writes: 200, nt: 600, polls: 600, reset_calls: 3600 };
+ 
+ const json = (data, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store' } });
+ // A wrong value from the page: the route stops and answers 400 with a short text.
+ class Bad extends Error {}
+ const bad = (text) => new Bad(text);
+ 
++const resets = automaticResets({ audios: AUDIOS, now: () => Date.now() / 1000, token: randomToken, hash: hmac, bad, prepareEntry: addEntry });
++
+ const ROUTES = {
++  'POST /api/resets/open': { run: resets.open, limit: 'reset_calls' },
++  'POST /api/resets/start': { run: resets.start, limit: 'reset_calls' },
++  'POST /api/resets/progress': { run: resets.progress, limit: 'reset_calls' },
++  'POST /api/resets/complete': { run: resets.complete, limit: 'reset_calls' },
+   'GET /api/me': me,
+   'GET /api/data': data,
+   'POST /api/entries': addEntry,
+@@ -331,7 +339,7 @@ async function saveDailyGrades({ env, user, body }) {
+ // again = "Reset again" (the same trade once more; it is not counted as a new trade).
+ // A start tilt or a reset sent again: its values count only when its tap is newer (NEWER); the answer is the row
+ // as it is now in D1.
+-async function addEntry({ env, user, body: sent }) {
++async function addEntry({ env, user, body: sent, prepareReset = false }) {
+   const body = oldGrade(sent);
+   const { kind } = body;
+   if (!KINDS.includes(kind)) throw bad(`kind: ${KINDS.join(', ')}`);
+@@ -388,7 +396,7 @@ async function addEntry({ env, user, body: sent }) {
+     const trade = await env.DB.prepare('SELECT id FROM trades WHERE id = ? AND user_id = ?').bind(tradeId, user.id).first();
+     if (!trade) throw bad('trade_id: not your trade');
+     const linked = await env.DB.prepare('SELECT id, request_id FROM entries WHERE user_id = ? AND trade_id = ?').bind(user.id, tradeId).first();
+-    if (linked && (requestId === null || linked.request_id !== requestId)) return json({ error: 'this trade already has a reset' }, 409);
++    if (!prepareReset && linked && (requestId === null || linked.request_id !== requestId)) return json({ error: 'this trade already has a reset' }, 409);
+   }
+   const tappedAt = tapValue(body.tapped_at);
+   const t = now();
+@@ -398,11 +406,16 @@ async function addEntry({ env, user, body: sent }) {
+       .bind(user.id, requestId, kind).first() : null;
+     const daily = ['start', 'before', 'end'].includes(kind) ? await env.DB.prepare('SELECT id FROM entries WHERE user_id = ? AND local_date = ? AND kind = ?')
+       .bind(user.id, local.date, kind).first() : null;
+-    if (!existing && !daily) return json({ error: 'too many entries in 24 hours' }, 429);
++    const linkedReset = prepareReset && tradeId !== null ? await env.DB.prepare('SELECT id FROM entries WHERE user_id = ? AND trade_id = ?').bind(user.id, tradeId).first() : null;
++    if (!existing && !daily && !linkedReset) return json({ error: 'too many entries in 24 hours' }, 429);
+   }
+   const insert = `INSERT INTO entries (user_id, ts, kind, "trigger", thought, audio_id, tilt_before, tilt_after, helped, note, local_date, local_hour, request_id, again, tapped_at, tilt_before_local, tilt_after_local, setup_grade, rules_kept, logic_id, pnl_cents, trade_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+   const values = [user.id, t, kind, trigger, thought, audioId, tiltBefore, tiltAfter, helped, note, local.date, local.hour, requestId, again, tappedAt, beforeLocal, afterLocal, grade, rules, logicId, pnl, tradeId];
++  if (prepareReset) return { insert, values, resetValues: {
++    trigger, thought, audio_id: audioId, tilt_before: tiltBefore, tilt_after: tiltAfter,
++    helped, note, tilt_before_local: beforeLocal, tilt_after_local: afterLocal, logic_id: logicId, tapped_at: tappedAt,
++  } };
+   // start / before / end: one row per day (a unique index), so two taps at once cannot make two rows.
+   const oncePerDay = "ON CONFLICT (user_id, local_date, kind) WHERE kind IN ('start', 'before', 'end')";
+   const sameDay = () => env.DB.prepare(`SELECT ${COLUMNS} FROM entries WHERE user_id = ? AND kind = ? AND local_date = ?`).bind(user.id, kind, local.date).first();
+@@ -575,6 +588,8 @@ async function newTrades({ env, user, url }) {
+ // paid: the paid gate runs. Disconnect has none: a member who stopped paying can still free one of his 5 PC places.
+ // json: the route reads a JSON body (disconnect needs none; a body sent is ignored).
+ const NT_ROUTES = {
++  'GET /api/nt/resets': { run: resets.pending, paid: true, limit: 'reset_calls' },
++  'POST /api/nt/resets/open': { run: resets.deviceOpen, paid: true, json: true, limit: 'reset_calls' },
+   'GET /api/nt/ping': { run: ntPing, paid: true },
+   'POST /api/nt/trades': { run: ntTrades, paid: true, json: true },
+   'POST /api/nt/disconnect': { run: ntDisconnect },
+@@ -588,7 +603,7 @@ export async function handleNt(request, env, path) {
+   if (!route) return json({ error: 'not found' }, 404); // also GET /api/device/claim, OPTIONS, HEAD
+   const found = await getDevice(request, env);
+   if (!found) return json({ error: 'not_connected' }, 401);
+-  if (await tooManyCalls(env, found.user.id, 'nt')) return json({ error: 'too many calls, wait a little' }, 429);
++  if (await tooManyCalls(env, found.user.id, route.limit || 'nt')) return json({ error: 'too many calls, wait a little' }, 429);
+   if (route.paid && !(await ensureAccess(env, found.user))) return json({ error: 'not_paid' }, 403); // nothing else in this answer
+   let body = null;
+   if (route.json) {
+@@ -597,7 +612,7 @@ export async function handleNt(request, env, path) {
+     body = read.body;
+   }
+   try {
+-    return await route.run({ env, ...found, body });
++    return await route.run({ env, ...found, body, url: new URL(request.url) });
+   } catch (e) {
+     if (e instanceof Bad) return json({ error: e.message }, 400);
+     throw e;
+@@ -783,7 +798,7 @@ async function ntTrades({ env, user, device, body }) {
+   if (!Array.isArray(list) || list.length < 1 || list.length > MAX_TRADES_PER_CALL) throw bad('trades: a list of 1 to 20 trades');
+   const good = [], rejected = [];
+   list.forEach((item, index) => {
+-    try { good.push(tradeValues(item, Date.now())); }
++    try { good.push({ ...tradeValues(item, Date.now()), index }); }
+     catch (e) { if (!(e instanceof Bad)) throw e; rejected.push({ index, error: e.message }); }
+   });
+   let fresh = [];
+@@ -833,5 +848,16 @@ async function ntTrades({ env, user, device, body }) {
+       else return json({ error: 'Trades changed during sync. Try again.' }, 503);
+     }
+   }
+-  return json({ inserted, duplicates: good.length - inserted, rejected });
++  const accepted = [];
++  if (body.auto_reset === true) {
++    for (const g of good) {
++      const saved = await env.DB.prepare('SELECT id FROM trades WHERE user_id = ? AND account = ? AND exit_exec_id = ?')
++        .bind(user.id, g.account, g.execId).first();
++      if (!saved) return json({ error: 'Trade confirmation changed; retry upload.' }, 503);
++      // Enqueue before ACK. A failed response can be retried: both the trade and request dedupe independently.
++      await resets.enqueue({ env, user }, saved.id);
++      accepted.push({ index: g.index, trade_id: saved.id });
++    }
++  }
++  return json({ inserted, duplicates: good.length - inserted, rejected, ...(body.auto_reset === true ? { accepted } : {}) });
+ }
+diff --git a/src/automatic-resets.js b/src/automatic-resets.js
+new file mode 100644
+index 0000000..a3b9db2
+--- /dev/null
++++ b/src/automatic-resets.js
+@@ -0,0 +1,107 @@
++// Authentication, paid access and same-origin enforcement live in the API/worker boundary.
++// Inject clock/crypto/entry validation so the actual SQL can be exercised in SQLite offline.
++export function automaticResets({ audios, now, token, hash, bad, prepareEntry }) {
++  const json = data => Response.json(data, {headers:{'Cache-Control':'no-store'}});
++  const id = value => { if (!Number.isSafeInteger(value) || value < 1) throw bad('trade_id'); return value; };
++  const entryFor = (env, uid, tid) => env.DB.prepare('SELECT * FROM entries WHERE user_id = ? AND trade_id = ?').bind(uid,tid).first();
++  const requestFor = async ({env,user,body}) => {
++    const row = await env.DB.prepare('SELECT * FROM automatic_resets WHERE user_id = ? AND trade_id = ?').bind(user.id,id(body.trade_id)).first();
++    if (!row) throw bad('reset not found');
++    return row;
++  };
++  const attemptFor = async ctx => {
++    const row = await requestFor(ctx);
++    if (!ctx.body.attempt_id || row.attempt_id !== ctx.body.attempt_id) throw bad('playback attempt expired');
++    return row;
++  };
++  const ready = row => row.position_seconds >= row.duration_seconds - 2 && row.played_seconds >= row.duration_seconds - 2;
++  return {
++    async enqueue({env,user}, tradeId) {
++      await env.DB.prepare(`INSERT INTO automatic_resets(user_id,trade_id,created_at)
++        SELECT user_id,id,? FROM trades WHERE user_id=? AND id=? ON CONFLICT(user_id,trade_id) DO NOTHING`).bind(now(),user.id,tradeId).run();
++    },
++    async pending({env,user,url}) {
++      const raw = url.searchParams.get('after') || '0';
++      if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw bad('after');
++      const {results} = await env.DB.prepare(`SELECT t.id AS trade_id,t.instrument,t.pnl_cents,t.currency,t.exit_time
++        FROM automatic_resets r JOIN trades t ON t.id=r.trade_id AND t.user_id=r.user_id
++        WHERE r.user_id=? AND r.completed_at IS NULL AND r.trade_id>? ORDER BY r.trade_id LIMIT 101`).bind(user.id,Number(raw)).all();
++      return json({member_id:user.id,pending:results.slice(0,100),next_cursor:results.length>100?results[99].trade_id:0});
++    },
++    async deviceOpen(ctx) {
++      const row = await requestFor(ctx);
++      if (row.completed_at !== null) throw bad('reset already completed');
++      const handoff=token(), expires= Math.floor(now())+300;
++      await ctx.env.DB.batch([
++        ctx.env.DB.prepare('DELETE FROM reset_handoffs WHERE expires_at < ?').bind(now()-3600),
++        ctx.env.DB.prepare('INSERT INTO reset_handoffs(token_hash,user_id,trade_id,device_id,expires_at) VALUES(?,?,?,?,?)')
++          .bind(await hash(ctx.env,'reset:'+handoff),ctx.user.id,row.trade_id,ctx.device.id,expires)
++      ]);
++      return json({url:new URL('/app/#nt-reset='+encodeURIComponent(handoff),ctx.url.origin).href,expires_at:expires*1000});
++    },
++    async open({env,user,body}) {
++      if (typeof body.handoff !== 'string' || body.handoff.length>150) throw bad('handoff invalid');
++      // Member predicate is inside the consuming UPDATE: another member cannot burn the token.
++      const row=await env.DB.prepare(`UPDATE reset_handoffs SET used_at=? WHERE token_hash=? AND user_id=?
++        AND used_at IS NULL AND expires_at>? AND EXISTS(SELECT 1 FROM devices d WHERE d.id=reset_handoffs.device_id
++          AND d.user_id=reset_handoffs.user_id AND d.revoked_at IS NULL) RETURNING trade_id`)
++        .bind(now(),await hash(env,'reset:'+body.handoff),user.id,now()).first();
++      if (!row) throw bad('handoff invalid or expired');
++      const trade=await env.DB.prepare('SELECT * FROM trades WHERE user_id=? AND id=?').bind(user.id,row.trade_id).first();
++      const reset=await env.DB.prepare('SELECT completed_at FROM automatic_resets WHERE user_id=? AND trade_id=?').bind(user.id,row.trade_id).first();
++      return json({trade,entry:await entryFor(env,user.id,row.trade_id),status:reset?.completed_at!=null?'completed':'pending'});
++    },
++    async start(ctx) {
++      const row=await requestFor(ctx), audio=audios[ctx.body.audio_id];
++      if(row.completed_at!==null) throw bad('reset already completed');
++      if(!/^b\d*$/.test(ctx.body.audio_id||'') || !audio || !(audio.seconds>2)) throw bad('audio_id');
++      const attempt=token(), stamp=now();
++      await ctx.env.DB.prepare(`UPDATE automatic_resets SET attempt_id=?,audio_id=?,duration_seconds=?,started_at=?,progress_at=?,position_seconds=0,played_seconds=0
++        WHERE user_id=? AND trade_id=? AND completed_at IS NULL`).bind(attempt,ctx.body.audio_id,audio.seconds,stamp,stamp,ctx.user.id,row.trade_id).run();
++      return json({attempt_id:attempt,duration_seconds:audio.seconds});
++    },
++    async progress(ctx) {
++      const row=await attemptFor(ctx), pos=ctx.body.position_seconds, stamp=now();
++      if(typeof pos!=='number'||!Number.isFinite(pos)||pos<row.position_seconds||pos>row.duration_seconds+2) throw bad('playback position');
++      const elapsed=Math.max(0,stamp-row.progress_at), delta=pos-row.position_seconds;
++      if(delta>elapsed+2) throw bad('playback seek is not allowed');
++      const played=Math.min(row.played_seconds+delta,stamp-row.started_at,row.duration_seconds);
++      await ctx.env.DB.prepare(`UPDATE automatic_resets SET progress_at=?,position_seconds=?,played_seconds=?
++        WHERE user_id=? AND trade_id=? AND attempt_id=? AND completed_at IS NULL AND progress_at=? AND position_seconds=?`)
++        .bind(stamp,pos,played,ctx.user.id,row.trade_id,row.attempt_id,row.progress_at,row.position_seconds).run();
++      const current=await attemptFor(ctx);
++      return json({played_seconds:current.played_seconds,duration_seconds:current.duration_seconds,ready:ready(current)});
++    },
++    async complete(ctx) {
++      const row=await attemptFor(ctx);
++      if(ctx.body.done!==true) throw bad('explicit Done is required');
++      if(row.completed_at!==null) return json({status:'completed',entry:await entryFor(ctx.env,ctx.user.id,row.trade_id)});
++      if(!ready(row)) throw bad('full playback is required');
++      const sent=ctx.body.entry;
++      if(!sent || !Number.isInteger(sent.tilt_after) || sent.tilt_after<0 || sent.tilt_after>10) throw bad('final tilt is required');
++      if(sent.audio_id!==row.audio_id) throw bad('audio_id differs from playback');
++      const existing=await entryFor(ctx.env,ctx.user.id,row.trade_id);
++      const prepared=await prepareEntry({...ctx,body:{...sent,kind:'after_trade',trade_id:row.trade_id,again:false,request_id:existing?.request_id||null},prepareReset:true});
++      if(prepared instanceof Response) return prepared;
++      const {insert,values,resetValues}=prepared;
++      // Resuming keeps trade identity/P&L; explicit grade edits behave like normal journal edits.
++      if (Object.hasOwn(sent, 'setup_grade')) resetValues.setup_grade = values[17];
++      if (Object.hasOwn(sent, 'rules_kept')) resetValues.rules_kept = values[18];
++      // Every mutation rechecks attempt identity within the same atomic D1 batch. A racing restart cannot finish an old attempt.
++      const eligible='EXISTS(SELECT 1 FROM automatic_resets r WHERE r.user_id=? AND r.trade_id=? AND r.attempt_id=? AND r.completed_at IS NULL AND r.played_seconds>=r.duration_seconds-2 AND r.position_seconds>=r.duration_seconds-2)';
++      const guard=[ctx.user.id,row.trade_id,row.attempt_id];
++      const insertSelect=insert.slice(0,insert.indexOf('VALUES'))+`SELECT ${values.map(()=>'?').join(',')} WHERE ${eligible} ON CONFLICT DO NOTHING`;
++      const fields=Object.keys(resetValues);
++      await ctx.env.DB.batch([
++        ctx.env.DB.prepare(insertSelect).bind(...values,...guard),
++        ctx.env.DB.prepare(`UPDATE entries SET ${fields.map(f=>'"'+f+'"=?').join(',')} WHERE user_id=? AND trade_id=? AND ${eligible}`)
++          .bind(...Object.values(resetValues),ctx.user.id,row.trade_id,...guard),
++        ctx.env.DB.prepare(`UPDATE automatic_resets SET completed_at=? WHERE user_id=? AND trade_id=? AND attempt_id=? AND completed_at IS NULL
++          AND EXISTS(SELECT 1 FROM entries e WHERE e.user_id=automatic_resets.user_id AND e.trade_id=automatic_resets.trade_id)`).bind(now(),...guard)
++      ]);
++      const final=await attemptFor(ctx);
++      if(final.completed_at===null) throw bad('completion changed; retry');
++      return json({status:'completed',entry:await entryFor(ctx.env,ctx.user.id,row.trade_id)});
++    }
++  };
++}
+diff --git a/src/cron.js b/src/cron.js
+index 947a3e9..3d50ccb 100644
+--- a/src/cron.js
++++ b/src/cron.js
+@@ -125,12 +125,12 @@ async function hashOf(text) {
+ 
+ // Last week's numbers of each member, only what the mail needs: last week's entries and check-ins, the resets of the
+ // last 90 days (pattern line), the day of the first reset, and the streak counted in SQL.
+-async function buildMails(env, users, monday) {
++export async function buildMails(env, users, monday) {
+   const lastMonday = addDays(monday, -7);
+   const sunday = addDays(monday, -1);
+   const ids = JSON.stringify(users.map((u) => u.id));
+   const weekBefore = addDays(lastMonday, -7);
+-  const [entries, firsts, checkins, streaks, loggedGrades, extraGrades, dayMoney, savedDays] = await env.DB.batch([
++  const [entries, firsts, checkins, streaks, loggedGrades, extraGrades, dayMoney, savedDays, importedTrades] = await env.DB.batch([
+     env.DB.prepare(`SELECT id, user_id, ts, kind, "trigger", thought, audio_id, tilt_before, tilt_after, tilt_before_local, tilt_after_local, local_date, local_hour FROM entries
+       WHERE user_id IN (SELECT value FROM json_each(?)) AND ((local_date <= ?
+         AND (local_date >= ? OR (kind = 'after_trade' AND local_date >= ?)))
+@@ -154,11 +154,13 @@ async function buildMails(env, users, monday) {
+       GROUP BY user_id, this_week`).bind(lastMonday, ids, weekBefore, sunday),
+     // The P/L line: each day of the reported week, his recorded trades with their typed P/L …
+     env.DB.prepare(`SELECT user_id, local_date, COUNT(*) AS trades, COUNT(pnl_cents) AS typed, SUM(pnl_cents) AS pnl FROM entries
+-      WHERE user_id IN (SELECT value FROM json_each(?)) AND kind = 'after_trade' AND again = 0
++      WHERE trade_id IS NULL AND user_id IN (SELECT value FROM json_each(?)) AND kind = 'after_trade' AND again = 0
+         AND "trigger" IN ('stop_loss', 'winning_trade', 'break_even') AND local_date BETWEEN ? AND ?
+       GROUP BY user_id, local_date`).bind(ids, lastMonday, sunday),
+     // … and the day values he saved (Journal → Edit): they win, like in the Journal.
+-    env.DB.prepare(`SELECT user_id, local_date, trades, pnl_cents FROM daily_summaries
++    env.DB.prepare(`SELECT user_id, local_date, trades, pnl_cents, currency FROM daily_summaries
++      WHERE user_id IN (SELECT value FROM json_each(?)) AND local_date BETWEEN ? AND ?`).bind(ids, lastMonday, sunday),
++    env.DB.prepare(`SELECT id, user_id, local_date, exit_time, pnl_cents, currency FROM trades
+       WHERE user_id IN (SELECT value FROM json_each(?)) AND local_date BETWEEN ? AND ?`).bind(ids, lastMonday, sunday),
+   ]);
+   const group = (rows) => {
+@@ -184,14 +186,15 @@ async function buildMails(env, users, monday) {
+   // user id → the reported week's trades and P/L by the Journal's day rule: { trades, typed, pnl }.
+   const dayMoneyOf = group(dayMoney.results);
+   const savedOf = group(savedDays.results);
++  const tradesOf = group(importedTrades.results);
+   const mails = [];
+   for (const user of users) {
+     const own = entriesOf.get(user.id) || [];
+-    const week = weekSummary(own, checkinsOf.get(user.id) || [], lastMonday);
++    const week = weekSummary(own, checkinsOf.get(user.id) || [], lastMonday, tradesOf.get(user.id) || [], savedOf.get(user.id) || []);
+     if (!week.hasData) continue;
+     week.streak.current = streakOf.get(user.id) || 0;
+     week.grades = gradesOf.get(user.id) || null;
+-    week.money = weekMoney(dayMoneyOf.get(user.id) || [], savedOf.get(user.id) || []);
++    week.money = weekMoney(dayMoneyOf.get(user.id) || [], savedOf.get(user.id) || [], tradesOf.get(user.id) || []);
+     mails.push({ user, ...(await weeklyMail(env, user, week, patternLine(own, sunday, firstOf.get(user.id)))) });
+   }
+   return mails;
+@@ -207,25 +210,31 @@ function aplusMailLine(grades) {
+ 
+ // The week's trades and P/L by the Journal's day rule (stats.js dayTotals): a value he saved for a day wins; an empty
+ // saved value = that day's recorded trades and the sum of their typed P/L. auto = [{ local_date, trades, typed, pnl }]
+-// (SQL, per day), saved = [{ local_date, trades, pnl_cents }]. → { trades, typed = trades with a P/L, pnl = null when
++// (SQL, per day, excluding linked resets), saved = [{ local_date, trades, pnl_cents, currency }]. → { trades, typed = trades with a P/L, pnl = null when
+ // no day has a P/L }. A day with a saved P/L counts all its trades as "with P/L".
+-export function weekMoney(auto, saved) {
++export function weekMoney(auto, saved, imported = []) {
+   let trades = 0, typed = 0, pnl = null;
+-  for (const date of new Set([...auto, ...saved].map((r) => r.local_date))) {
++  const currencies = new Set();
++  for (const date of new Set([...auto, ...saved, ...imported].map((r) => r.local_date))) {
+     const a = auto.find((r) => r.local_date === date);
+-    const t = dayTotals({ trades: a?.trades || 0, pnlTyped: a?.typed || 0, pnlCents: a?.typed ? a.pnl : null,
+-      summary: saved.find((r) => r.local_date === date) || null });
++    const nt = imported.filter((r) => r.local_date === date);
++    const summary = saved.find((r) => r.local_date === date) || null;
++    const count = (a?.trades || 0) + nt.length;
++    const withPnl = (a?.typed || 0) + nt.length;
++    const t = dayTotals({ trades: count, pnlTyped: withPnl,
++      pnlCents: withPnl ? (a?.pnl || 0) + nt.reduce((sum, r) => sum + r.pnl_cents, 0) : null, summary });
++    for (const currency of t.pnlEdited ? [summary.currency].filter(Boolean) : nt.map((r) => r.currency)) currencies.add(currency);
+     trades += t.trades;
+     typed += t.pnlEdited ? t.trades : Math.min(t.pnlTyped, t.trades);
+     if (t.pnlCents !== null) pnl = (pnl ?? 0) + t.pnlCents;
+   }
+-  return { trades, typed, pnl };
++  return { trades, typed, pnl, currencies: [...currencies], mixedCurrency: currencies.size > 1 };
+ }
+ 
+ // "Trades: 12 · P/L: +1,250 (10 of 12 trades with P/L)." — only when a day of the reported week has a P/L.
+ export function pnlMailLine(money) {
+   if (money?.pnl === null || money?.pnl === undefined) return null;
+-  return `Trades: ${money.trades} · P/L: ${formatAmount(money.pnl)}${money.trades ? ` (${money.typed} of ${money.trades} trades with P/L)` : ''}.`;
++  return `Trades: ${money.trades} · P/L: ${formatAmount(money.pnl)}${money.currencies?.length ? ` ${money.currencies.join(', ')}${money.mixedCurrency ? ' (mixed currencies, no conversion)' : ''}` : ''}${money.trades ? ` (${money.typed} of ${money.trades} trades with P/L)` : ''}.`;
+ }
+ 
+ async function weeklyMail(env, user, week, line) {

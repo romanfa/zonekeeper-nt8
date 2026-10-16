@@ -16,6 +16,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
     }
     public sealed class EngineSnapshot
     {
+        public int PendingResets { get; set; }
         public SessionSnapshot Session { get; set; }
         public List<AccountChoice> Accounts { get; set; }
         public List<string> Events { get; set; }
@@ -59,12 +60,21 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public static Task ConnectAsync(string input)
         {
             var run = ActiveRun();
-            return run == null ? Task.FromResult(0) : run.OperationAsync(s => s.ConnectAsync(input, Environment.MachineName, Helpers.NowMs(), run.Cancellation));
+            return run == null ? Task.FromResult(0) : run.OperationAsync(async s => {
+                await s.ConnectAsync(input, Environment.MachineName, Helpers.NowMs(), run.Cancellation).ConfigureAwait(false);
+                if (s.Snapshot().Status == ZkStatus.Connected) { run.resetsDisconnecting = false; run.WakeResets(); }
+            });
         }
         public static Task DisconnectAsync()
         {
             var run = ActiveRun();
+            if (run != null) { run.resetsDisconnecting = true; run.SuspendResets(); }
             return run == null ? Task.FromResult(0) : run.OperationAsync(s => s.DisconnectAsync(Helpers.NowMs(), run.Cancellation));
+        }
+        public static void ReopenResets()
+        {
+            var run = ActiveRun();
+            if (run != null && !run.Stopping && run.resets != null) { run.resets.Reopen(); run.UpdateResetWindow(); run.WakeResets(); }
         }
         public static Task SetAccountAsync(string name, bool enabled)
         {
@@ -100,6 +110,12 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             private Task lifetime;
             private Task fillTask;
             private Task senderTask;
+            private Task resetTask;
+            private readonly SemaphoreSlim resetWake = new SemaphoreSlim(0, 1);
+            private readonly System.Windows.Threading.Dispatcher resetDispatcher = NinjaTrader.Core.Globals.RandomDispatcher;
+            internal ResetCoordinator resets;
+            private ResetWindow resetWindow;
+            internal volatile bool resetsDisconnecting;
             private ApiClient api;
             private Settings settings;
             internal FillCoordinator fills;
@@ -123,6 +139,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             public void BeginStop()
             {
                 stopping = true;
+                SuspendResets();
                 cancel.Cancel();
                 if (watcher != null) watcher.Stop();
                 work.CompleteAdding();
@@ -207,7 +224,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 List<AccountChoice> choices;
                 lock (accountsGate) choices = accounts.Select(x => new AccountChoice { Name = x.Name, Enabled = x.Enabled }).ToList();
                 return new EngineSnapshot { Session = session == null ? new SessionSnapshot { Status = otherInstance ? ZkStatus.OtherInstance : ZkStatus.Checking, BaseUrl = Helpers.LiveBaseUrl } : session.Snapshot(),
-                    Accounts = choices, Events = log.Recent };
+                    Accounts = choices, Events = log.Recent, PendingResets = resets == null ? 0 : resets.PendingCount };
             }
             public Task OperationAsync(Func<SessionCoordinator, Task> action)
             {
@@ -272,6 +289,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                             fills = new FillCoordinator(new TradeBuilder(TimeZoneInfo.Local, log.Write), new OpenTradesFile(Path.Combine(folder, "open-trades.json"), files, log.Write), outbox);
                             api = new ApiClient(settings.BaseUrl, log.ProtectSecret);
                             session = new SessionCoordinator(settings, outbox, api, log);
+                            resets = new ResetCoordinator(Path.Combine(folder, "pending-resets.json"), files);
+                            session.Changed += OnResetSessionChanged;
                             session.Changed += Publish; session.WorkAvailable += Wake;
                             outbox.DurableAdded += trade => { log.TradeClosed(trade); session.NotifyQueued(); };
                             outbox.ReadyToSend += session.NotifyQueued;
@@ -290,8 +309,9 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     // Covers Stop racing startup between the cancellation check and watcher.Start.
                     if (stopping) watcher.Stop();
                     senderTask = Task.Run((Func<Task>)SenderLoopAsync);
+                    resetTask = Task.Run((Func<Task>)ResetLoopAsync);
                     log.Write("ZoneKeeper engine started (Active)."); Publish();
-                    await Task.WhenAll(fillTask, senderTask).ConfigureAwait(false);
+                    await Task.WhenAll(fillTask, senderTask, resetTask).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) { }
                 catch (Exception ex) { log.Error("Could not start ZoneKeeper", ex); }
@@ -300,6 +320,12 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     BeginStop();
                     if (fillTask != null) try { await fillTask.ConfigureAwait(false); } catch (Exception) { }
                     if (senderTask != null) try { await senderTask.ConfigureAwait(false); } catch (Exception) { }
+                    if (resetTask != null) try { await resetTask.ConfigureAwait(false); } catch (Exception) { }
+                    // Finish browser teardown before another run may acquire this engine's ownership.
+                    try { await resetDispatcher.InvokeAsync(new Action(() => {
+                        if (resetWindow != null) { var old = resetWindow; resetWindow = null; old.CloseAutomatically(); }
+                    })).Task.ConfigureAwait(false); } catch (Exception) { }
+                    if (session != null) session.Changed -= OnResetSessionChanged;
                     if (session != null) await session.QuiesceAsync().ConfigureAwait(false);
                     if (api != null) api.Dispose();
                     log.Write("ZoneKeeper engine stopped.");
@@ -349,6 +375,58 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 }
                 catch (OperationCanceledException) { }
                 catch (Exception ex) { log.Error("Could not send waiting trades", ex); }
+            }
+            internal void WakeResets() { try { resetWake.Release(); } catch (SemaphoreFullException) { } }
+            private void OnResetSessionChanged()
+            {
+                if (session.Snapshot().Status != ZkStatus.Connected) SuspendResets();
+                WakeResets();
+            }
+            internal void SuspendResets()
+            {
+                if (resets != null) resets.Suspend();
+                UpdateResetWindow();
+            }
+            internal void UpdateResetWindow()
+            {
+                try { resetDispatcher.InvokeAsync(new Action(() => {
+                    try
+                    {
+                        long id = !stopping && !resetsDisconnecting && session != null && session.Snapshot().Status == ZkStatus.Connected && resets != null ? resets.NextTradeId : 0;
+                        if (resetWindow != null && resetWindow.TradeId != id) { var old = resetWindow; resetWindow = null; old.CloseAutomatically(); }
+                        if (id == 0 || resetWindow != null) return;
+                        string token = settings.Token, origin = settings.BaseUrl;
+                        long member = resets.MemberId;
+                        var window = new ResetWindow(origin, Path.Combine(folder, "ResetBrowser", ResetCoordinator.OwnerKey(origin, member.ToString())), id, async () => {
+                            if (stopping || resetsDisconnecting || settings.Token != token || resets.NextTradeId != id || session.Snapshot().Status != ZkStatus.Connected) return null;
+                            var result = await api.OpenResetAsync(token, id, cancel.Token).ConfigureAwait(false);
+                            var answer = result.Body as ResetOpenAnswer;
+                            if (stopping || resetsDisconnecting || settings.Token != token || resets.NextTradeId != id || session.Snapshot().Status != ZkStatus.Connected ||
+                                result.Kind != ApiKind.Ok || answer == null || answer.ExpiresAt <= Helpers.NowMs() || !ResetCoordinator.ValidHandoff(origin, answer.Url)) return null;
+                            return answer.Url;
+                        }, () => { resets.Dismiss(); Publish(); });
+                        resetWindow = window;
+                        window.Closed += delegate { if (ReferenceEquals(resetWindow, window)) resetWindow = null; };
+                        window.Show();
+                    }
+                    catch (Exception) { if (resets != null) resets.Dismiss(); log.Write("Could not open reset browser. Use Reopen pending resets after checking WebView2 installation."); }
+                })); } catch (Exception) { }
+            }
+            private async Task ResetLoopAsync()
+            {
+                try
+                {
+                    while (!cancel.IsCancellationRequested)
+                    {
+                        if (!resetsDisconnecting && session.Snapshot().Status == ZkStatus.Connected)
+                            await resets.RefreshAsync(api, settings.BaseUrl, settings.Token, cancel.Token).ConfigureAwait(false);
+                        else resets.Suspend();
+                        UpdateResetWindow(); Publish();
+                        await resetWake.WaitAsync(15000, cancel.Token).ConfigureAwait(false);
+                    }
+                }
+                catch (OperationCanceledException) { }
+                catch (Exception) { SuspendResets(); log.Write("Pending resets could not refresh. Restart ZoneKeeper to retry."); }
             }
         }
     }
