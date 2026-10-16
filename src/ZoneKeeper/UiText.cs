@@ -20,6 +20,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public const string ConnectHelp = "Get the code on getzonekeeper.com → Cabinet → Platforms → NinjaTrader 8 → Connect NinjaTrader. It works for 10 minutes, one time.";
         public const string QueueFull = "Waiting list is full (500 trades). The oldest trade was dropped.";
         public const string SaveFailed = "Could not save a ZoneKeeper file. We try again soon.";
+        public const string AccountSaved = "Saved. You can close this window.";
         public const string DisconnectConfirm = "Disconnect this PC from ZoneKeeper? NinjaTrader stops sending trades. To connect again, you need a new code.";
         public static string Status(ZkStatus status, string email, long nextTryMs)
         {

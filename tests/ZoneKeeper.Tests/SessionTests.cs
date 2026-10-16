@@ -27,6 +27,46 @@ namespace ZoneKeeper.Tests
             public Task Step(long now = Fixtures.Time) { return Session.ProcessAsync(now, CancellationToken.None); }
             public void Dispose() { Folder.Dispose(); }
         }
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public async Task SavedAccountChoicePublishesHintThatSurvivesTradeUpdates(bool enabled)
+        {
+            using (var s = new Scope())
+            {
+                Assert.Equal("", s.Session.Snapshot().AccountSaveMessage);
+                s.Settings.SetAccount("Sim101", !enabled);
+                SessionSnapshot published = null;
+                s.Session.Changed += delegate { published = s.Session.Snapshot(); };
+                await s.Session.SetAccountAsync("Sim101", enabled, CancellationToken.None);
+                Assert.Equal(enabled, Fixtures.Settings(s.Files).IsEnabled("Sim101"));
+                Assert.False(s.Settings.IsDirty);
+                Assert.Equal("Saved. You can close this window.", published.AccountSaveMessage);
+                await s.Step(); s.Queue.Add(Fixtures.Trade()); await s.Step();
+                Assert.Equal(1, s.Api.Sends); Assert.Equal(0, s.Queue.Count);
+                Assert.Equal(UiText.AccountSaved, s.Session.Snapshot().AccountSaveMessage);
+                Assert.Equal(UiText.AccountSaved, published.AccountSaveMessage);
+            }
+        }
+        [Fact]
+        public async Task FailedAccountChoiceReplacesSavedHintUntilSettingsRetrySucceeds()
+        {
+            using (var s = new Scope())
+            {
+                await s.Session.SetAccountAsync("Sim101", false, CancellationToken.None);
+                Assert.Equal(UiText.AccountSaved, s.Session.Snapshot().AccountSaveMessage);
+                s.Files.FailWrites = path => path == "settings";
+                await s.Session.SetAccountAsync("Sim101", true, CancellationToken.None);
+                Assert.True(s.Settings.IsDirty); Assert.False(Fixtures.Settings(s.Files).IsEnabled("Sim101"));
+                Assert.Equal(UiText.SaveFailed, s.Session.Snapshot().AccountSaveMessage);
+                await s.Step();
+                Assert.Equal(UiText.SaveFailed, s.Session.Snapshot().AccountSaveMessage);
+                s.Files.FailWrites = null;
+                await s.Step(Fixtures.Time + 15000);
+                Assert.False(s.Settings.IsDirty); Assert.True(Fixtures.Settings(s.Files).IsEnabled("Sim101"));
+                Assert.Equal(UiText.AccountSaved, s.Session.Snapshot().AccountSaveMessage);
+            }
+        }
         [Fact]
         public async Task StartWithKeyChecksAndIdlePingsEveryFiveMinutes()
         {

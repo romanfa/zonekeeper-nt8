@@ -3,6 +3,6 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
 {
     public static class ZkVersion
     {
-        public const string Value = "0.1.0";
+        public const string Value = "0.1.1";
     }
 }

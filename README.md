@@ -6,6 +6,8 @@ Works with NinjaTrader 8 (8.1 or newer) on Windows. A ZoneKeeper subscription wi
 
 **Development status:** Main `3b3404e` compiled and was tested on Windows on 2026-10-15 with NinjaTrader 8.1.8.3. The release 0.1.0 compiled ZIP is built. Clean installation and updates remain unverified. The GitHub repository is public since 2026-10-15 (read the code; install with the ZIP).
 
+Source 0.1.1 is ready for a Windows F5 compile and ZIP export. It labels the sample code and confirms saved account choices. The live ZIP below remains 0.1.0 until the new export is checked and uploaded.
+
 ## Install the release ZIP
 
 The Import menu text below is confirmed on NinjaTrader 8.1.8.3. Clean installation remains unverified.
@@ -101,11 +103,11 @@ G0, G1 and G5 have the limited **PASSED 2026-10-15** results below. All other ch
 
 The release 0.1.0 compiled ZIP was built and checked on Windows on 2026-10-15. For later exports, use the steps below after compilation, tests, fresh code review and acceptance checks.
 
-1. Keep `VERSION`, `ZkVersion.Value` and the changelog version at `0.1.0`. Turn NinjaScript Editor Debug Mode off and press F5.
+1. Keep `VERSION`, `ZkVersion.Value` and the changelog version at `0.1.1`. Turn NinjaScript Editor Debug Mode off and press F5.
 2. Control Center → Tools → Export → NinjaScript… → **Export as compiled assembly**. Leave **Protect compiled assembly** unchecked. Select **all** source files under AddOns → ZoneKeeper; compare the export list with `src\ZoneKeeper\*.cs`. The export file name must be exactly **`ZoneKeeper`** (confirmed on Windows).
-3. Set Product `ZoneKeeper`, Version `0.1.0`, and export file name **`ZoneKeeper`**. Keep this name for every version so updates do not load a second assembly.
+3. Set Product `ZoneKeeper`, Version `0.1.1`, and export file name **`ZoneKeeper`**. Keep this name for every version so updates do not load a second assembly.
 4. Inspect `Documents\NinjaTrader 8\bin\Custom\ExportNinjaScript\ZoneKeeper.zip`: require one `ZoneKeeper.dll`, `Info.xml`, and the small NT-generated `ZoneKeeper.cs` stub (1143 bytes, no real source code).
-5. Copy the same bytes to `dist\ZoneKeeper-NT8-0.1.0.zip` and `dist\ZoneKeeper-NT8.zip`. Run `tools\checksum.ps1`; confirm both hashes in `dist\SHA256SUMS.txt` match.
+5. Copy the same bytes to `dist\ZoneKeeper-NT8-0.1.1.zip` and `dist\ZoneKeeper-NT8.zip`. Run `tools\checksum.ps1`; confirm both hashes in `dist\SHA256SUMS.txt` match. For the site handoff, also copy the ZIP to `C:\Users\Admin\Documents\Vault\Home\Trading\ZoneKeeper\ZoneKeeper-NT8.zip`.
 6. Complete G12 and G13 before release. For the clean install, **close NinjaTrader → run `tools/unlink-dev.ps1` → start NinjaTrader again** before importing the ZIP; follow G12 for restoring the development junction. Making the repository public, tagging/publishing a release and hosting the ZIP on the site remain separate coordinator/owner actions. This documentation does not publish or change the site.
 
 The final 0.1.0 ZIP is 224013 bytes; SHA256 `702d472f160d86040dc0ed4e462bfc1f9df5b9b4327c2452dbbfa139a772bc8c`. `ZoneKeeper.dll` is 755200 bytes. The same ZIP is available at [the live download address](https://getzonekeeper.com/downloads/ZoneKeeper-NT8.zip).

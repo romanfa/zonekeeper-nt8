@@ -1,9 +1,12 @@
 # Changelog
 
-## Planned for 0.1.1
+## 0.1.1 — source ready 2026-10-16
+
+Windows compile and ZIP export are pending. The live download is still 0.1.0.
 
 - Label the sample connect code `Example: ZK-AB3D-9KXP`.
 - Show the saved account hint: `Saved. You can close this window.`
+- Keep the hint through connection updates; a failed file save shows an error until it succeeds.
 
 ## 0.1.0 — first version
 

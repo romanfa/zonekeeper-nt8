@@ -17,6 +17,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private readonly TextBlock clock = Text("", false);
         private readonly TextBlock server = Text("", false);
         private readonly TextBlock message = Text("", false);
+        private readonly TextBlock accountSaveMessage = Text("", false);
         private readonly TextBox code = new TextBox { Margin = new Thickness(0, 4, 0, 8), ToolTip = "ZK-AB3D-9KXP", MinHeight = 28 };
         private readonly Button connect = MakeButton("Connect");
         private readonly StackPanel connectBox = new StackPanel();
@@ -33,9 +34,10 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             content.Children.Add(status); content.Children.Add(info);
             clock.Foreground = Brushes.DarkOrange; content.Children.Add(clock); content.Children.Add(server);
             connectBox.Children.Add(Text("Connect code", false)); connectBox.Children.Add(code);
-            connectBox.Children.Add(Text("ZK-AB3D-9KXP", false)); connectBox.Children.Add(connect);
+            connectBox.Children.Add(Text("Example: ZK-AB3D-9KXP", false)); connectBox.Children.Add(connect);
             connectBox.Children.Add(Text(UiText.ConnectHelp, false)); content.Children.Add(connectBox); content.Children.Add(message);
             content.Children.Add(Text("Send trades from these accounts", true)); content.Children.Add(accounts);
+            content.Children.Add(accountSaveMessage);
             content.Children.Add(Text("Playback accounts are never sent.", false));
             content.Children.Add(Text("Last events", true)); content.Children.Add(events);
             content.Children.Add(retry);
@@ -100,6 +102,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             clock.Text = UiText.ClockWarning(s.ClockOffsetMs); clock.Visibility = clock.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
             server.Text = "Test server: " + s.BaseUrl; server.Visibility = s.BaseUrl == Helpers.LiveBaseUrl ? Visibility.Collapsed : Visibility.Visible;
             message.Text = s.Message;
+            accountSaveMessage.Text = s.AccountSaveMessage;
+            accountSaveMessage.Visibility = string.IsNullOrEmpty(s.AccountSaveMessage) ? Visibility.Collapsed : Visibility.Visible;
             connectBox.Visibility = s.Status == ZkStatus.NotConnected ? Visibility.Visible : Visibility.Collapsed;
             if (s.HasToken) code.Clear();
             retry.Visibility = s.Status == ZkStatus.Paused || s.Status == ZkStatus.Offline ? Visibility.Visible : Visibility.Collapsed;

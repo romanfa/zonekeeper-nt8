@@ -13,6 +13,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public ZkStatus Status { get; set; }
         public string EmailMasked { get; set; }
         public string Message { get; set; }
+        public string AccountSaveMessage { get; set; }
         public long NextTryMs { get; set; }
         public long LastSentMs { get; set; }
         public long ClockOffsetMs { get; set; }
@@ -36,6 +37,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private bool singles;
         private volatile bool disconnectPending;
         private string message = "";
+        private string accountSaveMessage = "";
+        private bool accountSavePending;
         public event Action Changed;
         public event Action WorkAvailable;
         public SessionCoordinator(Settings localSettings, OutboxQueue queue, IAddonApi client, EventLog eventLog)
@@ -49,6 +52,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         {
             SessionSnapshot snapshot;
             lock (stateGate) snapshot = new SessionSnapshot { Status = status, Message = message,
+                AccountSaveMessage = accountSaveMessage,
                 NextTryMs = nextTryMs, LastSentMs = lastSentMs, ClockOffsetMs = clockOffsetMs };
             // Never acquire an external lock while holding stateGate.
             snapshot.EmailMasked = settings.EmailMasked; snapshot.Waiting = outbox.Count;
@@ -114,7 +118,12 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public async Task SetAccountAsync(string account, bool enabled, CancellationToken cancellation)
         {
             await serial.WaitAsync(cancellation).ConfigureAwait(false);
-            try { settings.SetAccount(account, enabled); Publish(); }
+            try
+            {
+                bool saved = settings.SetAccount(account, enabled);
+                lock (stateGate) { accountSavePending = !saved; accountSaveMessage = saved ? UiText.AccountSaved : UiText.SaveFailed; }
+                Publish();
+            }
             finally { serial.Release(); }
         }
         public async Task DisconnectAsync(long nowMs, CancellationToken cancellation)
@@ -170,6 +179,13 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     lock (stateGate) { nextTryMs = Math.Max(nextTryMs, nowMs + 15000); if (hasToken && status != ZkStatus.Paused) status = ZkStatus.Offline; }
                     Publish(); return;
                 }
+                bool accountSaveRecovered;
+                lock (stateGate)
+                {
+                    accountSaveRecovered = accountSavePending;
+                    if (accountSaveRecovered) { accountSavePending = false; accountSaveMessage = UiText.AccountSaved; }
+                }
+                if (accountSaveRecovered) Publish();
                 long due; lock (stateGate) due = nextTryMs;
                 if (settings.Token == null || nowMs < due) return;
                 if (disconnectPending) { await DisconnectCoreAsync(nowMs, cancellation).ConfigureAwait(false); return; }
