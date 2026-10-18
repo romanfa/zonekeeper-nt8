@@ -73,8 +73,8 @@ Roman owns all NinjaTrader actions and Sim101 orders. Use **only `https://getzon
 
 7. Complete the installed API checks in [docs/nt-api-notes.md](docs/nt-api-notes.md). Only after the references in step 5 are present, press **F5 in NinjaScript Editor** to compile. Visual Studio is for editing and debugging; do not build this add-on in Visual Studio. Require no ZoneKeeper compile errors or warnings.
 8. Open Control Center → New → ZoneKeeper. Get a code on the live Cabinet → Platforms → NinjaTrader 8, paste it into the add-on and click Connect. Confirm the PC and add-on version appear in the cabinet. Do not put codes or keys in logs or screenshots.
-9. On **Sim101**, close **two trades** after connection (for example, buy 1/sell 1, then sell 1/buy 1). Check the add-on log and `/api/trades` for both, once each. Cabinet → Journal trade rows are Phase C and are expected to be absent for now.
-10. While logged in to the live site, open `/api/trades?from=YYYY-MM-DD&to=YYYY-MM-DD` with today's date in both places. Compare the two trades' account, side, quantity, prices, net P/L, commission, times and exit name with NinjaTrader's executions. Zero commission is valid if Sim101 has no commission template.
+9. On **Sim101**, close **two trades** after connection (for example, buy 1/sell 1, then sell 1/buy 1). Check the add-on log and the `trades` list of `/api/data` for both, once each. Cabinet → Journal trade rows are Phase C and are expected to be absent for now.
+10. While logged in to the live site, open `/api/data?from=YYYY-MM-DD&to=YYYY-MM-DD` with today's date in both places and look at its `trades` list (`GET /api/trades` was removed 2026-10-18). Compare the two trades' account, side, quantity, prices, net P/L, commission, times and exit name with NinjaTrader's executions. Zero commission is valid if Sim101 has no commission template.
 
 ## Windows acceptance checklist
 
@@ -87,7 +87,7 @@ G0, G1 and G5 have the limited **PASSED 2026-10-15** results below. All other ch
 | G2 Partial exit | Buy 2, sell 1, sell 1: one trade, weighted exit price; final sell's execution ID closes it. |
 | G3 Flip | Buy 1, sell 2 in one fill, buy 1: one long and one short trade; split the reversal commission. |
 | G4 Breakeven | Use an ATM stop at entry: gross zero, net P/L equals negative commission, exit name recorded. |
-| G5 Compare | **PASSED 2026-10-15:** six Sim101 ES 12-26 trades sent once each matched NinjaTrader Executions and live `/api/trades` to the cent, including 2.88/side commission. |
+| G5 Compare | **PASSED 2026-10-15:** six Sim101 ES 12-26 trades sent once each matched NinjaTrader Executions and live `/api/trades` (now the `trades` list of `/api/data`) to the cent, including 2.88/side commission. |
 | G6 Offline/disconnect | Roman interrupts the network, closes a Sim101 trade, then reconnects: queued trade sends once. Roman disconnects this PC in the cabinet, then reconnects with a new code: 401 clears the old key and waiting trades send. Check add-on Disconnect also frees the device slot. |
 | G7 Restart | Roman ends NinjaTrader mid-trade and restarts: never resume the open trade; its close sends nothing and the next trade opened from flat sends once. Repeat with stale execution history and a second restart. Also restart after an offline closed trade and verify one delivery when its fill history remains available. Normal shutdown drains queued fills for the final current account objects and saves pending closed state; events from replaced objects must not alter it. |
 | G8 Lapsed plan | Fake tests cover `403 not_paid`, paused queue and retry. **No agent changes live account or billing data.** Roman may verify live behavior if a naturally lapsed account is available; otherwise record the live check as deferred. |

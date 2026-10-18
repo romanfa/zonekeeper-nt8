@@ -67,7 +67,7 @@ Use NinjaScript Editor's Visual Studio button, then View → Object Browser. Rec
 The 2026-10-13 additions to the server plan override older Phase B proposals:
 
 - `POST /api/nt/disconnect` uses Bearer auth and no body. `200 {"ok":true}` or `401 {"error":"not_connected"}` means delete the local key. There is no paid gate on this route; trades remain saved. Do not expect `{"revoked":true}`.
-- Optional `exit_name` is singular: final exit order name, trimmed, at most 32 characters, no control characters. Missing/null/empty becomes null. `/api/trades` returns it. Do not send `exit_names`.
+- Optional `exit_name` is singular: final exit order name, trimmed, at most 32 characters, no control characters. Missing/null/empty becomes null. `/api/data` returns it (in `trades`). Do not send `exit_names`.
 - Duplicate saved trades do not count toward the daily new-trade cap. On a 200 trades answer the whole batch is finished, including rejected entries; remove it from the outbox and log rejections.
 - Use the exact live base `https://getzonekeeper.com`, no `www`. Disable redirects and cookies in HttpClient. Never log the device key, connection code, full settings or raw HTTP body.
 
