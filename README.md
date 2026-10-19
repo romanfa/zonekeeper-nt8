@@ -23,6 +23,8 @@ Choose accounts under **Send trades from these accounts**. New accounts are enab
 
 Each closed trade sends `account`, `instrument`, `side`, `qty`, `entry_time`, `exit_time`, `entry_price`, `exit_price`, `pnl_cents`, `commission_cents`, `currency`, `point_value`, `exit_exec_id`, optional `entry_exec_ids`, optional `exit_name`, and `local_date`. Times are UTC milliseconds; `local_date` is the exit date in the Windows time zone. P/L is net after commission. Supported currencies are USD, CAD, EUR, GBP, AUD, CHF and NZD.
 
+A finished reset (0.2.0) sends `trade_id`, the thought key, the Reprogram Logic line id, the audio id (null when the audio was skipped before part 2), both tilts with their local times, `local`, `tapped_at` and a `request_id`, so a retry never makes a second Journal entry. The trade's P/L is copied by the server, never typed.
+
 Connecting also sends the PC name and add-on version. The add-on uses a device key, not the browser login cookie. It does not import past trading days. Open positions with an unknown start are followed but are not sent. Two PCs sending the same account and exit execution ID produce one saved trade.
 
 A trade that is open while NinjaTrader restarts is not sent. Add it later by CSV.
