@@ -122,6 +122,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
 
         private void WantTrade(long tradeId, bool activate)
         {
+            // A window whose browser could not start is replaced by a new one.
+            if (flow.View == ResetView.BrowserFailed) { Close(); Request(tradeId, open, activate); return; }
             RaiseQuietly(activate);
             Watch(flow.WantAsync(tradeId));
         }
