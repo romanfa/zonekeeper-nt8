@@ -198,6 +198,19 @@ namespace ZoneKeeper.Tests
             Assert.Equal(new[] { Login(812), Login(812) }, host.Navigated);
         }
         [Fact]
+        public async Task PagesThatKeepFailingWaitLongerEachTimeUntilAGoodPage()
+        {
+            var host = new FakeHost(); var flow = new ResetFlow(Base, host, 812);
+            await flow.BrowserReadyAsync();
+            for (int i = 0; i < 5; i++) await flow.PageFailedAsync();
+            Assert.Equal(new long[] { 5000, 15000, 30000, 60000, 60000 }, host.Delays);
+            Assert.Equal(6, host.Handoffs);
+            // A page that loads ("ready") starts the waits again from 5 s.
+            flow.MessageReceived(Page, Ready);
+            await flow.PageFailedAsync();
+            Assert.Equal(5000, host.Delays.Last());
+        }
+        [Fact]
         public async Task BrowserFailureStopsWithItsText()
         {
             var host = new FakeHost(); var flow = new ResetFlow(Base, host, 812);

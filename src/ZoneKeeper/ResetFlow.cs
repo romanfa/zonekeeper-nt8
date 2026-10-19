@@ -31,6 +31,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private long urlId;       // trade that rode in the last login link; the page opens it by itself
         private bool browserReady, pageReady, busy, stopped, closed;
         private int loginPages;
+        private int pageFailures;  // pages in a row that did not load; "ready" sets it back to 0
         public ResetView View { get; private set; }
 
         public ResetFlow(string siteBaseUrl, IResetHost resetHost, long firstTradeId)
@@ -80,6 +81,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         }
 
         // The page did not load (no internet, server error). The used key is gone: wait, then log in again.
+        // The wait grows (5 s, 15 s, 30 s, then 60 s), so a broken page never uses up the server limit.
         public Task PageFailedAsync()
         {
             if (closed || busy || stopped) return Done;
@@ -90,7 +92,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public void MessageReceived(string source, string json)
         {
             if (closed || !ResetRules.IsSiteUrl(baseUrl, source) || !ResetRules.IsReady(json)) return;
-            pageReady = true; loginPages = 0;
+            pageReady = true; loginPages = 0; pageFailures = 0;
             SendWaiting();
         }
 
@@ -126,7 +128,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 int attempt = 0;
                 if (waitFirst)
                 {
-                    long wait = ResetRules.RetryDelayMs(attempt++, null);
+                    long wait = ResetRules.RetryDelayMs(pageFailures++, null);
                     Show(ResetView.NoAnswer, wait);
                     await host.DelayAsync(wait, closing.Token);
                 }
