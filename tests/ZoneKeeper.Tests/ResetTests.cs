@@ -265,14 +265,24 @@ namespace ZoneKeeper.Tests
 
         // R5
         [Fact]
-        public void R5_LoginUrlAndSiteChecks()
+        public void R5_LoginRequestIsAPostWithTheKeyInHeaderAndBodyNotInTheUrl()
         {
             string key = "abc_DEF-" + new string('x', 35);
-            Assert.Equal("https://getzonekeeper.com/auth/addon?h=" + key + "&trade=812", ResetRules.LoginUrl(Base, key, 812));
-            Assert.Equal("https://getzonekeeper.com/auth/addon?h=" + key, ResetRules.LoginUrl(Base, key, 0));
-            Assert.Equal("https://test.example.com:8443/auth/addon?h=" + key, ResetRules.LoginUrl("https://test.example.com:8443", key, 0));
-            Assert.Null(ResetRules.LoginUrl(Base, "bad key", 812));
-            Assert.Null(ResetRules.LoginUrl("http://getzonekeeper.com", key, 812));
+            var login = ResetRules.LoginRequest(Base, key, 812);
+            Assert.Equal("POST", login.Method);
+            Assert.Equal("https://getzonekeeper.com/auth/addon?trade=812", login.Url);
+            Assert.DoesNotContain(key, login.Url); Assert.DoesNotContain("h=", login.Url);
+            Assert.Equal("Content-Type: application/x-www-form-urlencoded\r\nX-ZK-Handoff: " + key, login.Headers);
+            Assert.Equal("h=" + key, login.Body);
+            Assert.Equal("https://getzonekeeper.com/auth/addon", ResetRules.LoginRequest(Base, key, 0).Url);
+            Assert.Equal("https://test.example.com:8443/auth/addon", ResetRules.LoginRequest("https://test.example.com:8443", key, 0).Url);
+            Assert.Null(ResetRules.LoginRequest(Base, "bad key", 812));
+            Assert.Null(ResetRules.LoginRequest(Base, key + "\r\nX-Evil: 1", 812));
+            Assert.Null(ResetRules.LoginRequest("http://getzonekeeper.com", key, 812));
+        }
+        [Fact]
+        public void R5_SiteChecks()
+        {
             Assert.True(ResetRules.IsSiteUrl(Base, "https://getzonekeeper.com/app/?trade=1#today"));
             Assert.True(ResetRules.IsSiteUrl(Base, "https://GETZONEKEEPER.com/"));
             Assert.False(ResetRules.IsSiteUrl(Base, "https://evil.example.com/"));

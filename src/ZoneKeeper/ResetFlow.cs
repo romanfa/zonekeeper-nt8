@@ -11,7 +11,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
     public interface IResetHost
     {
         Task<HandoffResult> HandoffAsync();
-        void Navigate(string url);
+        void OpenLogin(LoginRequest request);
         void Post(string json);
         void ShowStatus(ResetView view, long retryMs);
         Task DelayAsync(long ms, CancellationToken cancellation);
@@ -137,12 +137,12 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     Show(ResetView.Opening, 0);
                     var result = await host.HandoffAsync() ?? HandoffResult.Of(HandoffStatus.Offline);
                     if (closed) return;
-                    string url = result.Status == HandoffStatus.Ok ? ResetRules.LoginUrl(baseUrl, result.Handoff, waitingId) : null;
-                    if (url != null)
+                    var login = result.Status == HandoffStatus.Ok ? ResetRules.LoginRequest(baseUrl, result.Handoff, waitingId) : null;
+                    if (login != null)
                     {
                         urlId = waitingId; waitingId = 0; pageReady = false;
                         Show(ResetView.Page, 0);
-                        host.Navigate(url);
+                        host.OpenLogin(login);
                         return;
                     }
                     if (result.Status == HandoffStatus.NotPaid) { stopped = true; Show(ResetView.NotPaid, 0); return; }

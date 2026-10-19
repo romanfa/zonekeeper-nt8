@@ -56,10 +56,10 @@ After each closed trade, a **ZoneKeeper Reset** window comes on top of the chart
 - It never takes the keyboard focus: your hotkeys and Chart Trader clicks still go to NinjaTrader. Your first click into the window activates it.
 - One window for all trades. A new trade while it is open goes into the same window (the page decides when to show it). Closing the window = skip this reset.
 - Turn it off with **Open the reset after each closed trade** in the ZoneKeeper window (on by default, `auto_reset` in `settings.json`). **Open reset window** opens it by hand.
-- Login: the add-on asks `POST /api/nt/handoff` (device key) for a one-use key that works for 60 seconds. The window opens `/auth/addon` with it and gets the normal cabinet login for this PC. The device key never goes into the browser, a link or the page. Disconnect ends that login.
+- Login: the add-on asks `POST /api/nt/handoff` (device key) for a one-use key that works for 60 seconds. The window sends it with `POST /auth/addon?trade=<id>` (header `X-ZK-Handoff` and form field `h`, never in the link) and gets the normal cabinet login for this PC. The device key never goes into the browser, a link or the page. Disconnect ends that login.
 - No answer from the site: the window stays and tries again after 5 s, 15 s, 30 s, then every 60 s. Plan not active: it says so and does not try again by itself. PC disconnected: the window closes. Trade sending never waits for the window.
 - Needs the Microsoft Edge WebView2 Runtime (NinjaTrader's installer adds it) and the WebView2 DLLs: NinjaTrader's own copy (path N) or SDK `1.0.4258.31` files in `bin\Custom` (path S, `tools\get-webview2.ps1`). Step 0 on Windows decides which. The code compiles with WebView2 SDK 1.0.902.49 or newer.
-- Needs the site to send `ids` in the `POST /api/nt/trades` answer and to have `POST /api/nt/handoff` and `GET /auth/addon`. An older site: no window, one log line.
+- Needs the site to send `ids` in the `POST /api/nt/trades` answer and to have `POST /api/nt/handoff` and `POST /auth/addon`. An older site: no window, one log line.
 
 See the [ZoneKeeper privacy policy](https://getzonekeeper.com/privacy/).
 

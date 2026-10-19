@@ -30,6 +30,16 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public string LoaderFolder { get; set; }
     }
 
+    // The window's first navigation: POST /auth/addon with the one-use key in a header and in the form body.
+    // The key is never in the URL (no CSRF link, nothing in server or browser logs).
+    public sealed class LoginRequest
+    {
+        public string Url { get; set; }
+        public string Method { get; set; }
+        public string Headers { get; set; }   // CRLF between headers, as WebView2 wants it
+        public string Body { get; set; }
+    }
+
     [DataContract]
     public sealed class PageMessage
     {
@@ -66,14 +76,16 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
 
         public static bool ValidHandoff(string handoff) { return Regex.IsMatch(handoff ?? "", @"\A[A-Za-z0-9_-]{43}\z"); }
 
-        // The one-use login link for the window. Returns null for a bad key.
-        public static string LoginUrl(string baseUrl, string handoff, long tradeId)
+        // The login request for the window. Only the trade id is in the URL. Returns null for a bad key.
+        public static LoginRequest LoginRequest(string baseUrl, string handoff, long tradeId)
         {
             Uri site;
             if (!ValidHandoff(handoff) || !TrySite(baseUrl, out site)) return null;
-            string url = site.GetLeftPart(UriPartial.Authority) + "/auth/addon?h=" + Uri.EscapeDataString(handoff);
-            if (tradeId > 0) url += "&trade=" + tradeId.ToString(CultureInfo.InvariantCulture);
-            return url;
+            string url = site.GetLeftPart(UriPartial.Authority) + "/auth/addon";
+            if (tradeId > 0) url += "?trade=" + tradeId.ToString(CultureInfo.InvariantCulture);
+            return new LoginRequest { Url = url, Method = "POST",
+                Headers = "Content-Type: application/x-www-form-urlencoded\r\nX-ZK-Handoff: " + handoff,
+                Body = "h=" + Uri.EscapeDataString(handoff) };
         }
 
         // True only for the ZoneKeeper site itself: same scheme, host and port, no user name in the link.

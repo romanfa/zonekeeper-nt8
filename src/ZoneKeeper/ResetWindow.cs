@@ -2,7 +2,9 @@
 // this file only shows them. Every event handler has its own try/catch: nothing reaches NinjaTrader.
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Reflection;
+using System.Text;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -218,7 +220,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         }
 
         Task<HandoffResult> IResetHost.HandoffAsync() { return ZkEngine.HandoffAsync(); }
-        void IResetHost.Navigate(string url) { if (browser != null) browser.Navigate(url); }
+        void IResetHost.OpenLogin(LoginRequest request) { if (browser != null) browser.OpenLogin(request); }
         void IResetHost.Post(string json) { if (browser != null) browser.Post(json); }
         void IResetHost.ShowStatus(ResetView view, long retryMs)
         {
@@ -236,6 +238,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private static bool loaderSet;
         private readonly ResetWindow owner;
         private readonly WebView2 view = new WebView2();
+        private CoreWebView2Environment environment;
         private CoreWebView2 core;
         private bool disposed;
 
@@ -263,9 +266,10 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
 
         public async Task StartAsync(string userDataFolder)
         {
-            var environment = await CoreWebView2Environment.CreateAsync(null, userDataFolder, null);
+            var created = await CoreWebView2Environment.CreateAsync(null, userDataFolder, null);
             if (disposed) return;
-            await view.EnsureCoreWebView2Async(environment);
+            await view.EnsureCoreWebView2Async(created);
+            environment = created;
             if (disposed) return;
             core = view.CoreWebView2;
             var settings = core.Settings;
@@ -285,7 +289,21 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             core.ProcessFailed += OnProcessFailed;
         }
 
-        // The login link holds the one-use key: never log it or an exception message about it.
+        // POST /auth/addon with the one-use key in the X-ZK-Handoff header and the form body, never in the URL.
+        // Never log the request or an exception message about it. (SDK 1.0.790.44 and newer have this API.)
+        public void OpenLogin(LoginRequest login)
+        {
+            try
+            {
+                if (core == null || environment == null || login == null) return;
+                var body = new MemoryStream(Encoding.UTF8.GetBytes(login.Body));
+                var request = environment.CreateWebResourceRequest(login.Url, login.Method, body, login.Headers);
+                core.NavigateWithWebResourceRequest(request);
+            }
+            catch (Exception ex) { ZkEngine.ReportError("Reset window could not open the page", ex); }
+        }
+
+        // Site pages without any key (links the member clicked).
         public void Navigate(string url)
         {
             try { if (core != null) core.Navigate(url); }
@@ -357,6 +375,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     core.ProcessFailed -= OnProcessFailed;
                     core = null;
                 }
+                environment = null;
             }
             catch (Exception ex) { ZkEngine.ReportError("Reset window cleanup", ex); }
             try { view.Dispose(); }

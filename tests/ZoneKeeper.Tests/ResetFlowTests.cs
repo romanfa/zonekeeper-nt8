@@ -19,6 +19,7 @@ namespace ZoneKeeper.Tests
         {
             public readonly Queue<HandoffResult> Answers = new Queue<HandoffResult>();
             public readonly List<string> Navigated = new List<string>();
+            public readonly List<LoginRequest> Logins = new List<LoginRequest>();
             public readonly List<string> Posted = new List<string>();
             public readonly List<string> Logs = new List<string>();
             public readonly List<ResetView> Views = new List<ResetView>();
@@ -27,7 +28,7 @@ namespace ZoneKeeper.Tests
             public bool BlockDelays;
             public Task<HandoffResult> HandoffAsync()
             { Handoffs++; return Task.FromResult(Answers.Count == 0 ? Ok() : Answers.Dequeue()); }
-            public void Navigate(string url) { Navigated.Add(url); }
+            public void OpenLogin(LoginRequest request) { Navigated.Add(request.Url); Logins.Add(request); }
             public void Post(string json) { Posted.Add(json); }
             public void ShowStatus(ResetView view, long retryMs) { Views.Add(view); }
             public Task DelayAsync(long ms, CancellationToken cancellation)
@@ -36,7 +37,7 @@ namespace ZoneKeeper.Tests
         }
         private static HandoffResult Ok() { return new HandoffResult { Status = HandoffStatus.Ok, Handoff = Fixtures.HandoffKey }; }
         private static HandoffResult Fail(HandoffStatus status) { return HandoffResult.Of(status); }
-        private static string Login(long trade) { return ResetRules.LoginUrl(Base, Fixtures.HandoffKey, trade); }
+        private static string Login(long trade) { return ResetRules.LoginRequest(Base, Fixtures.HandoffKey, trade).Url; }
 
         [Fact]
         public async Task FirstTradeRidesInTheLoginLinkAndIsNotSentAgain()
@@ -45,6 +46,11 @@ namespace ZoneKeeper.Tests
             Assert.Equal(ResetView.Starting, flow.View);
             await flow.BrowserReadyAsync();
             Assert.Equal(new[] { Login(812) }, host.Navigated); Assert.Equal(ResetView.Page, flow.View);
+            // The key goes in the header and the body of a POST, never in the URL.
+            var login = host.Logins[0];
+            Assert.Equal("POST", login.Method); Assert.Equal("https://getzonekeeper.com/auth/addon?trade=812", login.Url);
+            Assert.DoesNotContain(Fixtures.HandoffKey, login.Url);
+            Assert.Contains("X-ZK-Handoff: " + Fixtures.HandoffKey, login.Headers); Assert.Equal("h=" + Fixtures.HandoffKey, login.Body);
             Assert.Equal(NavigationChoice.Allow, flow.NavigationStarting(Login(812), false));
             flow.MessageReceived(Page, Ready);
             Assert.Empty(host.Posted); Assert.Equal(1, host.Handoffs);
