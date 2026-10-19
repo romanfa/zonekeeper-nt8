@@ -25,8 +25,11 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private readonly ListBox events = new ListBox { MinHeight = 120, MaxHeight = 200 };
         private readonly Button retry = MakeButton("Try again now");
         private readonly Button disconnect = MakeButton("Disconnect this PC");
+        private readonly CheckBox autoReset = new CheckBox { Content = UiText.AutoResetLabel, Margin = new Thickness(0, 4, 0, 4) };
+        private readonly Button openReset = MakeButton(UiText.OpenResetButton);
         private bool closed;
         private bool connecting;
+        private bool rendering;
         public ZoneKeeperWindow()
         {
             Caption = "ZoneKeeper"; Width = 480; Height = 600; MinWidth = 360; MinHeight = 400;
@@ -39,6 +42,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             content.Children.Add(Text("Send trades from these accounts", true)); content.Children.Add(accounts);
             content.Children.Add(accountSaveMessage);
             content.Children.Add(Text("Playback accounts are never sent.", false));
+            content.Children.Add(Text(UiText.ResetTitle, true)); content.Children.Add(autoReset); content.Children.Add(openReset);
             content.Children.Add(Text("Last events", true)); content.Children.Add(events);
             content.Children.Add(retry);
             var open = MakeButton("Open getzonekeeper.com");
@@ -55,8 +59,13 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 finally { connecting = false; if (!closed) { connect.Content = "Connect"; connect.IsEnabled = true; Render(); } }
             };
             retry.Click += delegate { ZkEngine.TryNow(); };
+            // Render sets IsChecked from the saved setting; only a click by the member saves it.
+            autoReset.Checked += async delegate { if (!rendering) await ZkEngine.SetAutoResetAsync(true); };
+            autoReset.Unchecked += async delegate { if (!rendering) await ZkEngine.SetAutoResetAsync(false); };
+            openReset.Click += delegate { ZkEngine.OpenResetWindow(); };
             disconnect.Click += async delegate {
                 if (!DisconnectPrompt.Confirm(this)) return;
+                ZkEngine.CloseResetWindow();
                 disconnect.IsEnabled = false;
                 try { await ZkEngine.DisconnectAsync(); }
                 finally { if (!closed) { disconnect.IsEnabled = true; Render(); } }
@@ -108,6 +117,10 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             if (s.HasToken) code.Clear();
             retry.Visibility = s.Status == ZkStatus.Paused || s.Status == ZkStatus.Offline ? Visibility.Visible : Visibility.Collapsed;
             disconnect.Visibility = s.HasToken ? Visibility.Visible : Visibility.Collapsed;
+            openReset.Visibility = s.HasToken ? Visibility.Visible : Visibility.Collapsed;
+            rendering = true;
+            try { autoReset.IsChecked = s.AutoReset; }
+            finally { rendering = false; }
             accounts.Children.Clear();
             if (snapshot.Accounts.Count == 0) accounts.Children.Add(Text("No accounts yet. Connect NinjaTrader to your broker first.", false));
             foreach (var choice in snapshot.Accounts)

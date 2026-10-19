@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using NinjaTrader.Cbi;
@@ -54,7 +55,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public static EngineSnapshot Snapshot()
         {
             var run = ActiveRun();
-            return run == null ? new EngineSnapshot { Session = new SessionSnapshot { Status = ZkStatus.NotConnected, NextTryMs = 0, BaseUrl = Helpers.LiveBaseUrl }, Accounts = new List<AccountChoice>(), Events = new List<string>() } : run.Snapshot();
+            return run == null ? new EngineSnapshot { Session = new SessionSnapshot { Status = ZkStatus.NotConnected, NextTryMs = 0, BaseUrl = Helpers.LiveBaseUrl, AutoReset = true }, Accounts = new List<AccountChoice>(), Events = new List<string>() } : run.Snapshot();
         }
         public static Task ConnectAsync(string input)
         {
@@ -87,6 +88,56 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             try { var run = ActiveRun(); if (run != null) run.Queue(() => run.log.Error(context, exception)); }
             catch (Exception) { }
         }
+        public static void Note(string message)
+        {
+            try { var run = ActiveRun(); if (run != null) run.Queue(() => run.log.Write(message)); }
+            catch (Exception) { }
+        }
+        public static bool Running { get { var run = ActiveRun(); return run != null && !run.Stopping && run.session != null; } }
+        // The reset window asks for its one-use login key here. HTTP runs on the thread pool, never on the UI thread.
+        public static Task<HandoffResult> HandoffAsync()
+        {
+            var run = ActiveRun();
+            if (run == null || run.Stopping || run.session == null) return Task.FromResult(HandoffResult.Of(HandoffStatus.Offline));
+            return Task.Run(async () => {
+                try { return await run.session.HandoffAsync(Helpers.NowMs(), run.Cancellation).ConfigureAwait(false); }
+                catch (Exception) { return HandoffResult.Of(HandoffStatus.Offline); }
+            });
+        }
+        // Button "Open reset window": file and settings reads happen on the thread pool.
+        public static void OpenResetWindow()
+        {
+            var run = ActiveRun();
+            if (run == null || run.Stopping) return;
+            Task.Run(() => run.RequestReset(0, true));
+        }
+        public static void CloseResetWindow() { CloseReset(); }
+        public static Task SetAutoResetAsync(bool on)
+        {
+            var run = ActiveRun();
+            return run == null ? Task.FromResult(0) : Task.Run(() => run.SetAutoReset(on));
+        }
+        public static void SaveResetBounds(WindowBounds bounds)
+        {
+            var run = ActiveRun();
+            if (run != null) Task.Run(() => run.SaveResetBounds(bounds));
+        }
+        // The reset window needs the WebView2 DLLs. If they are missing, .NET fails while it compiles a method
+        // that uses ResetWindow. These small NoInlining helpers keep that failure inside a try/catch here.
+        private static void ShowReset(long tradeId, ResetOpen open, bool activate)
+        {
+            try { ShowResetCore(tradeId, open, activate); }
+            catch (Exception ex) { Note(UiText.ResetStartFailed(ex.GetType().Name)); }
+        }
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void ShowResetCore(long tradeId, ResetOpen open, bool activate) { ResetWindow.Request(tradeId, open, activate); }
+        private static void CloseReset()
+        {
+            try { CloseResetCore(); }
+            catch (Exception) { }
+        }
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void CloseResetCore() { ResetWindow.CloseIfOpen(); }
 
         private sealed class Run
         {
@@ -123,6 +174,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             public void BeginStop()
             {
                 stopping = true;
+                CloseReset();
                 cancel.Cancel();
                 if (watcher != null) watcher.Stop();
                 work.CompleteAdding();
@@ -200,13 +252,37 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     return executions;
                 });
             }
+            public void RequestReset(long tradeId, bool activate)
+            {
+                try
+                {
+                    if (stopping || settings == null) return;
+                    var open = new ResetOpen { BaseUrl = settings.BaseUrl, Bounds = settings.ResetWindow,
+                        UserDataFolder = Path.Combine(folder, "webview2"),
+                        LoaderFolder = ResetRules.LoaderFolder(Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "bin", "Custom"), File.Exists) };
+                    ShowReset(tradeId, open, activate);
+                }
+                catch (Exception ex) { log.Error("Could not open the reset window", ex); }
+            }
+            public void SetAutoReset(bool on)
+            {
+                // Never write settings while stopping: after F5 the new engine owns the file.
+                try { if (!stopping && settings != null) settings.SetAutoReset(on); }
+                catch (Exception ex) { log.Error(UiText.SaveFailed, ex); }
+                Publish();
+            }
+            public void SaveResetBounds(WindowBounds bounds)
+            {
+                try { if (!stopping && settings != null) settings.SetResetWindow(bounds); }
+                catch (Exception ex) { log.Error(UiText.SaveFailed, ex); }
+            }
             public void SetAccounts(List<AccountChoice> choices)
             { lock (accountsGate) accounts = choices; Publish(); }
             public EngineSnapshot Snapshot()
             {
                 List<AccountChoice> choices;
                 lock (accountsGate) choices = accounts.Select(x => new AccountChoice { Name = x.Name, Enabled = x.Enabled }).ToList();
-                return new EngineSnapshot { Session = session == null ? new SessionSnapshot { Status = otherInstance ? ZkStatus.OtherInstance : ZkStatus.Checking, BaseUrl = Helpers.LiveBaseUrl } : session.Snapshot(),
+                return new EngineSnapshot { Session = session == null ? new SessionSnapshot { Status = otherInstance ? ZkStatus.OtherInstance : ZkStatus.Checking, BaseUrl = Helpers.LiveBaseUrl, AutoReset = true } : session.Snapshot(),
                     Accounts = choices, Events = log.Recent };
             }
             public Task OperationAsync(Func<SessionCoordinator, Task> action)
@@ -271,8 +347,10 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                             var outbox = new OutboxQueue(Path.Combine(folder, "outbox.jsonl"), files, log.Write);
                             fills = new FillCoordinator(new TradeBuilder(TimeZoneInfo.Local, log.Write), new OpenTradesFile(Path.Combine(folder, "open-trades.json"), files, log.Write), outbox);
                             api = new ApiClient(settings.BaseUrl, log.ProtectSecret);
-                            session = new SessionCoordinator(settings, outbox, api, log);
+                            session = new SessionCoordinator(settings, outbox, api, log) { RunStartedMs = Helpers.NowMs() };
                             session.Changed += Publish; session.WorkAvailable += Wake;
+                            session.ResetWanted += id => { if (!stopping) RequestReset(id, false); };
+                            session.KeyRemoved += CloseReset;
                             outbox.DurableAdded += trade => { log.TradeClosed(trade); session.NotifyQueued(); };
                             outbox.ReadyToSend += session.NotifyQueued;
                             break;
@@ -298,6 +376,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 finally
                 {
                     BeginStop();
+                    CloseReset();
                     if (fillTask != null) try { await fillTask.ConfigureAwait(false); } catch (Exception) { }
                     if (senderTask != null) try { await senderTask.ConfigureAwait(false); } catch (Exception) { }
                     if (session != null) await session.QuiesceAsync().ConfigureAwait(false);
