@@ -15,7 +15,6 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         Task<ApiResult> PingAsync(string token, CancellationToken cancellation);
         Task<ApiResult> SendTradesAsync(string token, List<TradeRecord> trades, CancellationToken cancellation);
         Task<ApiResult> DisconnectAsync(string token, CancellationToken cancellation);
-        Task<ApiResult> HandoffAsync(string token, CancellationToken cancellation);
     }
     public sealed class ApiClient : IAddonApi
     {
@@ -56,9 +55,6 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         { return CallAsync<TradesAnswer>(HttpMethod.Post, "/api/nt/trades", token, Json.Write(new TradesBody { Trades = trades }), cancellation); }
         public Task<ApiResult> DisconnectAsync(string token, CancellationToken cancellation)
         { return CallAsync<DisconnectAnswer>(HttpMethod.Post, "/api/nt/disconnect", token, null, cancellation); }
-        // One-use login key for the reset window (valid 60 seconds). No body.
-        public Task<ApiResult> HandoffAsync(string token, CancellationToken cancellation)
-        { return CallAsync<HandoffAnswer>(HttpMethod.Post, "/api/nt/handoff", token, null, cancellation); }
         private async Task<ApiResult> CallAsync<T>(HttpMethod method, string path, string token, string body, CancellationToken cancellation)
         {
             try
@@ -88,8 +84,6 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                                 result.Body = answer;
                                 var claim = answer as ClaimAnswer;
                                 if (claim != null) protectSecret(claim.Token);
-                                var handoff = answer as HandoffAnswer;
-                                if (handoff != null) protectSecret(handoff.Handoff);
                             }
                         }
                         return result;

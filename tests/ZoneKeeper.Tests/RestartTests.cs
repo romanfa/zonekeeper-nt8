@@ -22,8 +22,6 @@ namespace ZoneKeeper.Tests
             { Sent.AddRange(trades); return Inner.SendTradesAsync(token, trades, cancellation); }
             public Task<ApiResult> DisconnectAsync(string token, CancellationToken cancellation)
             { return Inner.DisconnectAsync(token, cancellation); }
-            public Task<ApiResult> HandoffAsync(string token, CancellationToken cancellation)
-            { return Inner.HandoffAsync(token, cancellation); }
             public void Dispose() { Inner.Dispose(); }
         }
         private sealed class Harness

@@ -40,17 +40,16 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private string message = "";
         private string accountSaveMessage = "";
         private bool accountSavePending;
-        private bool unsupportedLogged;
-        // Trade ids this run already opened in the reset window (the last 200).
+        // Trade ids this run already raised the window for (the last 200).
         private readonly Queue<long> openedOrder = new Queue<long>();
         private readonly HashSet<long> opened = new HashSet<long>();
         public event Action Changed;
         public event Action WorkAvailable;
-        // A fresh trade was saved: open the reset window for this trade id.
+        // A fresh trade was saved: bring the window up with the reset for this trade id.
         public event Action<long> ResetWanted;
-        // The device key was deleted (Disconnect or 401): the reset window must close.
+        // The device key was deleted (Disconnect or 401): a running reset must stop.
         public event Action KeyRemoved;
-        // Engine start time. Trades closed before it never open the reset window (no pop-up after a restart).
+        // Engine start time. Trades closed before it never raise the window (no pop-up after a restart).
         public long RunStartedMs { get; set; }
         public SessionCoordinator(Settings localSettings, OutboxQueue queue, IAddonApi client, EventLog eventLog)
         {
@@ -84,7 +83,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             var handler = KeyRemoved;
             if (handler != null) foreach (Action subscriber in handler.GetInvocationList()) try { subscriber(); } catch (Exception) { }
         }
-        // A reset window error must never stop trade sending.
+        // A window error must never stop trade sending.
         private void RaiseResetWanted(long tradeId)
         {
             var handler = ResetWanted;
@@ -280,36 +279,6 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             finally { if (sendGuard != null) sendGuard.Dispose(); serial.Release(); }
             // Raised after the send is fully done and outside every lock.
             if (resetId > 0) RaiseResetWanted(resetId);
-        }
-        // Gets a one-use login key for the reset window. Only 401 and 403 not_paid change the connection
-        // (same policy as a send). No answer, 429 and 5xx never touch it, so trade sending goes on.
-        public async Task<HandoffResult> HandoffAsync(long nowMs, CancellationToken cancellation)
-        {
-            await serial.WaitAsync(cancellation).ConfigureAwait(false);
-            try
-            {
-                string token = settings.Token;
-                if (token == null || disconnectPending) return HandoffResult.Of(HandoffStatus.NotConnected);
-                var result = await api.HandoffAsync(token, cancellation).ConfigureAwait(false);
-                cancellation.ThrowIfCancellationRequested();
-                var answer = result.Body as HandoffAnswer;
-                if (result.Kind == ApiKind.Ok && answer != null && ResetRules.ValidHandoff(answer.Handoff))
-                    return new HandoffResult { Status = HandoffStatus.Ok, Handoff = answer.Handoff };
-                if (result.Kind == ApiKind.NotConnected || result.Kind == ApiKind.NotPaid)
-                {
-                    Apply(result, nowMs); Publish(); Wake();
-                    return HandoffResult.Of(result.Kind == ApiKind.NotPaid ? HandoffStatus.NotPaid : HandoffStatus.NotConnected);
-                }
-                if (result.Status == 404)
-                {
-                    if (!unsupportedLogged) { unsupportedLogged = true; log.Write(UiText.ResetUnsupported); }
-                    return HandoffResult.Of(HandoffStatus.Unsupported);
-                }
-                return new HandoffResult { Status = HandoffStatus.Offline, RetryAfter = result.RetryAfter };
-            }
-            catch (OperationCanceledException) { return HandoffResult.Of(HandoffStatus.Offline); }
-            catch (Exception ex) { log.Error("Could not get a reset login", ex); return HandoffResult.Of(HandoffStatus.Offline); }
-            finally { serial.Release(); }
         }
         private static bool ValidTradesAnswer(TradesAnswer answer, int count)
         {

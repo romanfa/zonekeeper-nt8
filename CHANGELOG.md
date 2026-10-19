@@ -2,13 +2,15 @@
 
 ## 0.2.0 — source ready 2026-10-19
 
-Not compiled in NinjaTrader yet. Step 0 (which WebView2 DLLs NinjaTrader has) and the Windows tests come first. Includes the 0.1.1 changes.
+Not compiled in NinjaTrader yet. The Windows tests come first. Includes the 0.1.1 changes.
 
-- Automatic reset: after a closed trade (exit at most 10 minutes ago, during this NinjaTrader run) one reused "ZoneKeeper Reset" window opens on top of the chart without taking the keyboard focus. Closing it = skip.
-- Checkbox "Open the reset after each closed trade" (on by default) and button "Open reset window".
-- Reads the trade `ids` from the `POST /api/nt/trades` answer; gets a one-use login key from `POST /api/nt/handoff`. The device key never enters the browser.
-- No answer: the window stays and tries again with growing waits. Plan not active: it says so, no retry loop. Disconnect, F5 and NinjaTrader exit close the window.
-- Step 0 probe (`probes/BrowserProbe`) and path S tools (`tools/get-webview2.ps1`, `tools/pack-zip.ps1`).
+- The ZoneKeeper window has two tabs: Today (today's trades with Reset / Saving… / Logged, the 5-step reset with normal Windows controls) and Connection (the old content).
+- After a closed trade (exit at most 10 minutes ago, during this NinjaTrader run) the window comes on top of the chart without taking the keyboard, and opens the reset for that trade. A running reset is never interrupted.
+- Reset texts come from the site (`GET /api/nt/catalog`, kept in `catalog.json`, refreshed every 6 hours). Today's list from `GET /api/nt/today`.
+- The voice is downloaded for each reset with the device key (`GET /api/nt/audio/<id>`), played from one temp file and deleted after it plays. Nothing is cached. No internet → the reset runs with the timer.
+- The step-5 tilt tap saves the reset (`resets.jsonl`, sent after the trades with `POST /api/nt/resets`). No Done button.
+- Checkbox "Open the reset after each closed trade" (on by default). Reads the trade `ids` from the `POST /api/nt/trades` answer.
+- The browser reset window of the earlier 0.2.0 source is gone: no extra DLLs, no browser login.
 
 ## 0.1.1 — source ready 2026-10-16
 

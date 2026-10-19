@@ -27,7 +27,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         [DataMember(Name = "debug_fills")] public bool DebugFills { get; set; }
         // Missing in files from 0.1.x: null means on.
         [DataMember(Name = "auto_reset", EmitDefaultValue = false)] public bool? AutoReset { get; set; }
-        [DataMember(Name = "reset_window", EmitDefaultValue = false)] public WindowBounds ResetWindow { get; set; }
+        [DataMember(Name = "window", EmitDefaultValue = false)] public WindowBounds Window { get; set; }
         public SettingsData() { Version = 1; DisabledAccounts = new List<string>(); }
     }
     public sealed class Settings
@@ -90,11 +90,11 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             lock (gate) { data.AutoReset = on; dirty = true; return SaveLocked(); }
         }
         // Bad saved values are ignored: the window then opens at the default place.
-        public WindowBounds ResetWindow { get { lock (gate) return ResetRules.ValidBounds(data.ResetWindow) ? data.ResetWindow.Copy() : null; } }
-        public bool SetResetWindow(WindowBounds bounds)
+        public WindowBounds WindowBounds { get { lock (gate) return ResetRules.ValidBounds(data.Window) ? data.Window.Copy() : null; } }
+        public bool SetWindowBounds(WindowBounds bounds)
         {
             if (!ResetRules.ValidBounds(bounds)) return false;
-            lock (gate) { data.ResetWindow = bounds.Copy(); dirty = true; return SaveLocked(); }
+            lock (gate) { data.Window = bounds.Copy(); dirty = true; return SaveLocked(); }
         }
         public bool SetAccount(string account, bool enabled)
         {

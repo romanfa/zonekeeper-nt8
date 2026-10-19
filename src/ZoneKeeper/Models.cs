@@ -11,7 +11,6 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
 {
     public enum ZkStatus { NotConnected, Checking, Connected, Paused, Offline, OtherInstance }
     public enum ApiKind { Ok, NotConnected, NotPaid, CodeInvalid, TooManyDevices, TooManyTries, TooMany, BadRequest, Offline }
-    public enum HandoffStatus { Ok, NotConnected, NotPaid, Unsupported, Offline }
 
     public static class Helpers
     {
@@ -324,19 +323,6 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
     {
         [DataMember(Name = "index")] public int Index { get; set; }
         [DataMember(Name = "id")] public long Id { get; set; }
-    }
-    [DataContract] public sealed class HandoffAnswer
-    {
-        [DataMember(Name = "handoff")] public string Handoff { get; set; }
-        [DataMember(Name = "expires_in")] public int ExpiresIn { get; set; }
-    }
-    // What the reset window gets back when it asks for a one-use login key.
-    public sealed class HandoffResult
-    {
-        public HandoffStatus Status { get; set; }
-        public string Handoff { get; set; }
-        public TimeSpan? RetryAfter { get; set; }
-        public static HandoffResult Of(HandoffStatus status) { return new HandoffResult { Status = status }; }
     }
     [DataContract] public sealed class TradesBody
     {

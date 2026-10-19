@@ -11,7 +11,7 @@ using Xunit;
 
 namespace ZoneKeeper.Tests
 {
-    // Add-on 0.2.0: the reset window opens by itself after a closed trade (plan note 29).
+    // Add-on 0.2.0: the window comes up by itself after a closed trade (plan notes 29 and 31).
     public sealed class ResetTests
     {
         private const string Base = Helpers.LiveBaseUrl;
@@ -143,183 +143,6 @@ namespace ZoneKeeper.Tests
             Assert.Null(ResetRules.PickTrade(batch, null, now, 0, null));
         }
 
-        // R4
-        [Fact]
-        public async Task R4_ApiClientPostsHandoffWithBearerAndNoBodyAndMasksTheKey()
-        {
-            using (var folder = new TestFolder())
-            {
-                var log = new EventLog(folder.Path); var handler = new FakeHttp();
-                string key = Fixtures.HandoffKey;
-                handler.Send = async (request, cancellation) => {
-                    Assert.Equal(HttpMethod.Post, request.Method); Assert.Equal("/api/nt/handoff", request.RequestUri.AbsolutePath);
-                    Assert.Equal("Bearer", request.Headers.Authorization.Scheme); Assert.Equal(Fixtures.Token, request.Headers.Authorization.Parameter);
-                    Assert.Null(request.Content);
-                    await Task.Yield();
-                    return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{\"handoff\":\"" + key + "\",\"expires_in\":60}") };
-                };
-                using (var client = new ApiClient(Base, handler, log.ProtectSecret))
-                {
-                    var result = await client.HandoffAsync(Fixtures.Token, CancellationToken.None);
-                    Assert.Equal(ApiKind.Ok, result.Kind); Assert.Equal(key, ((HandoffAnswer)result.Body).Handoff); Assert.Equal(60, ((HandoffAnswer)result.Body).ExpiresIn);
-                }
-                log.Write("Opening https://getzonekeeper.com/auth/addon?h=" + key);
-                Assert.DoesNotContain(key, log.Recent[0]); Assert.Contains("[redacted]", log.Recent[0]);
-            }
-        }
-        [Fact]
-        public async Task R4_HandoffOkReturnsTheKeyAndNeedsAToken()
-        {
-            using (var s = new Scope())
-            {
-                var result = await s.Session.HandoffAsync(Fixtures.Time, CancellationToken.None);
-                Assert.Equal(HandoffStatus.Ok, result.Status); Assert.Equal(Fixtures.HandoffKey, result.Handoff); Assert.Equal(1, s.Api.Handoffs);
-            }
-            using (var s = new Scope(connected: false))
-            {
-                Assert.Equal(HandoffStatus.NotConnected, (await s.Session.HandoffAsync(Fixtures.Time, CancellationToken.None)).Status);
-                Assert.Equal(0, s.Api.Handoffs);
-            }
-        }
-        [Fact]
-        public async Task R4_Handoff401ForgetsTheKeyAndClosesTheWindow()
-        {
-            using (var s = new Scope())
-            {
-                await s.Step(Fixtures.Time);
-                s.Api.HandoffAnswers.Enqueue(new ApiResult { Kind = ApiKind.NotConnected, Status = 401, Error = "not_connected" });
-                Assert.Equal(HandoffStatus.NotConnected, (await s.Session.HandoffAsync(Fixtures.Time, CancellationToken.None)).Status);
-                Assert.Null(s.Settings.Token); Assert.Equal(ZkStatus.NotConnected, s.Session.Snapshot().Status);
-                Assert.Equal(UiText.Disconnected, s.Session.Snapshot().Message); Assert.Equal(1, s.KeyRemoved);
-            }
-        }
-        [Fact]
-        public async Task R4_Handoff403NotPaidPausesAndKeepsTheKey()
-        {
-            using (var s = new Scope())
-            {
-                await s.Step(Fixtures.Time);
-                s.Api.HandoffAnswers.Enqueue(new ApiResult { Kind = ApiKind.NotPaid, Status = 403, Error = "not_paid" });
-                Assert.Equal(HandoffStatus.NotPaid, (await s.Session.HandoffAsync(Fixtures.Time, CancellationToken.None)).Status);
-                Assert.Equal(ZkStatus.Paused, s.Session.Snapshot().Status); Assert.NotNull(s.Settings.Token); Assert.Equal(0, s.KeyRemoved);
-            }
-        }
-        [Fact]
-        public async Task R4_Handoff404IsUnsupportedAndLogsOnce()
-        {
-            using (var s = new Scope())
-            {
-                await s.Step(Fixtures.Time);
-                for (int i = 0; i < 2; i++)
-                {
-                    s.Api.HandoffAnswers.Enqueue(new ApiResult { Kind = ApiKind.Offline, Status = 404 });
-                    Assert.Equal(HandoffStatus.Unsupported, (await s.Session.HandoffAsync(Fixtures.Time, CancellationToken.None)).Status);
-                }
-                Assert.Equal(1, s.Log.Recent.Count(x => x.EndsWith(UiText.ResetUnsupported, StringComparison.Ordinal)));
-                Assert.Equal(ZkStatus.Connected, s.Session.Snapshot().Status);
-            }
-        }
-        [Fact]
-        public async Task R4_HandoffNoAnswerOr429NeverChangesTradeSending()
-        {
-            using (var s = new Scope())
-            {
-                await s.Step(Fixtures.Time);
-                long next = s.Session.Snapshot().NextTryMs;
-                s.Api.HandoffAnswers.Enqueue(new ApiResult { Kind = ApiKind.TooMany, Status = 429, RetryAfter = TimeSpan.FromSeconds(90) });
-                var busy = await s.Session.HandoffAsync(Fixtures.Time, CancellationToken.None);
-                Assert.Equal(HandoffStatus.Offline, busy.Status); Assert.Equal(TimeSpan.FromSeconds(90), busy.RetryAfter);
-                s.Api.HandoffAnswers.Enqueue(new ApiResult { Kind = ApiKind.Offline, Status = 503 });
-                Assert.Equal(HandoffStatus.Offline, (await s.Session.HandoffAsync(Fixtures.Time, CancellationToken.None)).Status);
-                s.Api.HandoffAnswers.Enqueue(new ApiResult { Kind = ApiKind.Offline, Error = "No answer from getzonekeeper.com." });
-                Assert.Equal(HandoffStatus.Offline, (await s.Session.HandoffAsync(Fixtures.Time, CancellationToken.None)).Status);
-                Assert.Equal(ZkStatus.Connected, s.Session.Snapshot().Status); Assert.Equal(next, s.Session.Snapshot().NextTryMs);
-                // A trade still goes out at once.
-                s.Queue.Add(Fixtures.Trade()); await s.Step(Fixtures.Time);
-                Assert.Equal(1, s.Api.Sends); Assert.Equal(0, s.Queue.Count);
-            }
-        }
-        [Theory]
-        [InlineData("short")]
-        [InlineData(null)]
-        [InlineData("zkd_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
-        [InlineData("hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh!")]
-        public async Task R4_HandoffWithABadKeyIsTreatedAsNoAnswer(string key)
-        {
-            using (var s = new Scope())
-            {
-                s.Api.HandoffAnswers.Enqueue(new ApiResult { Kind = ApiKind.Ok, Status = 200, Body = new HandoffAnswer { Handoff = key, ExpiresIn = 60 } });
-                Assert.Equal(HandoffStatus.Offline, (await s.Session.HandoffAsync(Fixtures.Time, CancellationToken.None)).Status);
-                s.Api.HandoffAnswers.Enqueue(new ApiResult { Kind = ApiKind.Ok, Status = 200, Body = null });
-                Assert.Equal(HandoffStatus.Offline, (await s.Session.HandoffAsync(Fixtures.Time, CancellationToken.None)).Status);
-            }
-        }
-        [Fact]
-        public async Task R4_ApiClientBadHandoffJsonIsOffline()
-        {
-            var handler = new FakeHttp();
-            handler.Send = (request, cancellation) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("not json") });
-            using (var client = new ApiClient(Base, handler, delegate { }))
-                Assert.Equal(ApiKind.Offline, (await client.HandoffAsync(Fixtures.Token, CancellationToken.None)).Kind);
-        }
-
-        // R5
-        [Fact]
-        public void R5_LoginRequestIsAPostWithTheKeyInHeaderAndBodyNotInTheUrl()
-        {
-            string key = "abc_DEF-" + new string('x', 35);
-            var login = ResetRules.LoginRequest(Base, key, 812);
-            Assert.Equal("POST", login.Method);
-            Assert.Equal("https://getzonekeeper.com/auth/addon?trade=812", login.Url);
-            Assert.DoesNotContain(key, login.Url); Assert.DoesNotContain("h=", login.Url);
-            Assert.Equal("Content-Type: application/x-www-form-urlencoded\r\nX-ZK-Handoff: " + key, login.Headers);
-            Assert.Equal("h=" + key, login.Body);
-            Assert.Equal("https://getzonekeeper.com/auth/addon", ResetRules.LoginRequest(Base, key, 0).Url);
-            Assert.Equal("https://test.example.com:8443/auth/addon", ResetRules.LoginRequest("https://test.example.com:8443", key, 0).Url);
-            Assert.Null(ResetRules.LoginRequest(Base, "bad key", 812));
-            Assert.Null(ResetRules.LoginRequest(Base, key + "\r\nX-Evil: 1", 812));
-            Assert.Null(ResetRules.LoginRequest("http://getzonekeeper.com", key, 812));
-        }
-        [Fact]
-        public void R5_SiteChecks()
-        {
-            Assert.True(ResetRules.IsSiteUrl(Base, "https://getzonekeeper.com/app/?trade=1#today"));
-            Assert.True(ResetRules.IsSiteUrl(Base, "https://GETZONEKEEPER.com/"));
-            Assert.False(ResetRules.IsSiteUrl(Base, "https://evil.example.com/"));
-            Assert.False(ResetRules.IsSiteUrl(Base, "https://getzonekeeper.com.evil.example.com/"));
-            Assert.False(ResetRules.IsSiteUrl(Base, "http://getzonekeeper.com/"));
-            Assert.False(ResetRules.IsSiteUrl(Base, "https://getzonekeeper.com:8443/"));
-            Assert.False(ResetRules.IsSiteUrl(Base, "https://user:pw@getzonekeeper.com/"));
-            Assert.False(ResetRules.IsSiteUrl(Base, "not a url"));
-            Assert.False(ResetRules.IsSiteUrl(Base, null));
-            Assert.True(ResetRules.IsLoginPage(Base, "https://getzonekeeper.com/login/?state=expired"));
-            Assert.True(ResetRules.IsLoginPage(Base, "https://getzonekeeper.com/login"));
-            Assert.False(ResetRules.IsLoginPage(Base, "https://getzonekeeper.com/loginhelp/"));
-            Assert.False(ResetRules.IsLoginPage(Base, "https://evil.example.com/login/"));
-        }
-        [Fact]
-        public void R5_NavigationKeepsSitePagesAndSendsOtherClicksToTheNormalBrowser()
-        {
-            Assert.Equal(NavigationChoice.Allow, ResetRules.Navigation(Base, "https://getzonekeeper.com/app/#today", false));
-            Assert.Equal(NavigationChoice.LoginPage, ResetRules.Navigation(Base, "https://getzonekeeper.com/login/?state=expired", false));
-            Assert.Equal(NavigationChoice.OpenOutside, ResetRules.Navigation(Base, "https://www.youtube.com/@getzonekeeper", true));
-            Assert.Equal(NavigationChoice.Block, ResetRules.Navigation(Base, "https://www.youtube.com/@getzonekeeper", false));
-            Assert.Equal(NavigationChoice.Block, ResetRules.Navigation(Base, "http://example.com/", true));
-            Assert.Equal(NavigationChoice.Block, ResetRules.Navigation(Base, "javascript:alert(1)", true));
-            Assert.Equal(NavigationChoice.Block, ResetRules.Navigation(Base, "file:///C:/Windows/", true));
-            Assert.Equal(NavigationChoice.Block, ResetRules.Navigation(Base, "https://user@example.com/", true));
-        }
-
-        // R6
-        [Fact]
-        public void R6_WebMessages()
-        {
-            Assert.Equal("{\"type\":\"trade\",\"id\":812}", ResetRules.TradeMessage(812));
-            Assert.True(ResetRules.IsReady("{\"type\":\"ready\"}"));
-            foreach (string junk in new[] { "{\"type\":\"trade\"}", "\"ready\"", "junk", "", null, "{}", "[1,2]", "{\"type\":5}" })
-                Assert.False(ResetRules.IsReady(junk));
-        }
-
         // R7
         [Fact]
         public async Task R7_GoodSendWithIdsRaisesResetWantedOnceAndLogsIt()
@@ -439,7 +262,7 @@ namespace ZoneKeeper.Tests
             var files = new MemoryFiles();
             files.Write("settings", "{\"version\":1,\"disabled_accounts\":[\"Playback101\"],\"debug_fills\":false}");
             var old = Fixtures.Settings(files);
-            Assert.True(old.AutoReset); Assert.Null(old.ResetWindow); Assert.False(old.IsEnabled("Playback101"));
+            Assert.True(old.AutoReset); Assert.Null(old.WindowBounds); Assert.False(old.IsEnabled("Playback101"));
             Assert.True(old.SetAutoReset(false));
             Assert.Contains("\"auto_reset\":false", files.Read("settings"));
             Assert.False(Fixtures.Settings(files).AutoReset);
@@ -452,18 +275,18 @@ namespace ZoneKeeper.Tests
         {
             var files = new MemoryFiles();
             var settings = Fixtures.Settings(files);
-            Assert.True(settings.SetResetWindow(new WindowBounds { Left = 1200, Top = 40, Width = 470, Height = 880 }));
-            var back = Fixtures.Settings(files).ResetWindow;
-            Assert.Equal(1200, back.Left); Assert.Equal(40, back.Top); Assert.Equal(470, back.Width); Assert.Equal(880, back.Height);
-            Assert.False(settings.SetResetWindow(new WindowBounds { Left = 0, Top = 0, Width = 100, Height = 880 }));
-            Assert.False(settings.SetResetWindow(null));
-            foreach (string bad in new[] { "{\"left\":0,\"top\":0,\"width\":10,\"height\":880}", "{\"left\":0,\"top\":0,\"width\":460,\"height\":-5}",
-                "{\"left\":9e12,\"top\":0,\"width\":460,\"height\":860}", "{\"left\":0,\"top\":0,\"width\":460,\"height\":99999}", "{}" })
+            Assert.True(settings.SetWindowBounds(new WindowBounds { Left = 1200, Top = 40, Width = 470, Height = 700 }));
+            var back = Fixtures.Settings(files).WindowBounds;
+            Assert.Equal(1200, back.Left); Assert.Equal(40, back.Top); Assert.Equal(470, back.Width); Assert.Equal(700, back.Height);
+            Assert.False(settings.SetWindowBounds(new WindowBounds { Left = 0, Top = 0, Width = 100, Height = 700 }));
+            Assert.False(settings.SetWindowBounds(null));
+            foreach (string bad in new[] { "{\"left\":0,\"top\":0,\"width\":10,\"height\":700}", "{\"left\":0,\"top\":0,\"width\":480,\"height\":-5}",
+                "{\"left\":9e12,\"top\":0,\"width\":480,\"height\":720}", "{\"left\":0,\"top\":0,\"width\":480,\"height\":99999}", "{}" })
             {
                 var badFiles = new MemoryFiles();
-                badFiles.Write("settings", "{\"version\":1,\"disabled_accounts\":[],\"reset_window\":" + bad + "}");
+                badFiles.Write("settings", "{\"version\":1,\"disabled_accounts\":[],\"window\":" + bad + "}");
                 var loaded = Fixtures.Settings(badFiles);
-                Assert.Null(loaded.ResetWindow); Assert.True(loaded.AutoReset);
+                Assert.Null(loaded.WindowBounds); Assert.True(loaded.AutoReset);
             }
         }
         [Fact]
@@ -472,36 +295,14 @@ namespace ZoneKeeper.Tests
             var screen = new WindowBounds { Left = 0, Top = 0, Width = 1920, Height = 1080 };
             var work = new WindowBounds { Left = 0, Top = 0, Width = 1920, Height = 1040 };
             var fallback = ResetRules.Place(null, screen, work);
-            Assert.Equal(1460, fallback.Left); Assert.Equal(0, fallback.Top); Assert.Equal(460, fallback.Width); Assert.Equal(860, fallback.Height);
+            Assert.Equal(1440, fallback.Left); Assert.Equal(0, fallback.Top); Assert.Equal(480, fallback.Width); Assert.Equal(720, fallback.Height);
             var saved = new WindowBounds { Left = 100, Top = 50, Width = 500, Height = 900 };
             Assert.Equal(100, ResetRules.Place(saved, screen, work).Left);
             // Second monitor that is gone now: back to the default place.
-            Assert.Equal(1460, ResetRules.Place(new WindowBounds { Left = 2500, Top = 50, Width = 500, Height = 900 }, screen, work).Left);
-            Assert.Equal(1460, ResetRules.Place(new WindowBounds { Left = 100, Top = 1070, Width = 500, Height = 900 }, screen, work).Left);
+            Assert.Equal(1440, ResetRules.Place(new WindowBounds { Left = 2500, Top = 50, Width = 500, Height = 900 }, screen, work).Left);
+            Assert.Equal(1440, ResetRules.Place(new WindowBounds { Left = 100, Top = 1070, Width = 500, Height = 900 }, screen, work).Left);
             // Small work area: the height fits it.
             Assert.Equal(700, ResetRules.Place(null, screen, new WindowBounds { Left = 0, Top = 0, Width = 1280, Height = 700 }).Height);
-        }
-        [Fact]
-        public void LoaderFolderIsSetOnlyWhenOurLoaderIsInBinCustom()
-        {
-            string custom = System.IO.Path.Combine("C:", "NT", "bin", "Custom");
-            string loader = System.IO.Path.Combine(custom, "WebView2Loader.dll");
-            Assert.Equal(custom, ResetRules.LoaderFolder(custom, path => path == loader));
-            Assert.Null(ResetRules.LoaderFolder(custom, path => false));
-            Assert.Null(ResetRules.LoaderFolder(null, path => true));
-        }
-        [Fact]
-        public void OnlyADeadMainBrowserProcessClosesTheWindow()
-        {
-            Assert.True(ResetRules.ClosesWindow("BrowserProcessExited"));
-            foreach (string kind in new[] { "RenderProcessExited", "RenderProcessUnresponsive", "FrameRenderProcessExited", "GpuProcessExited", "UtilityProcessExited", "SandboxHelperProcessExited", "UnknownProcessExited", "", null })
-                Assert.False(ResetRules.ClosesWindow(kind));
-        }
-        [Fact]
-        public void BrowserProfileLivesInLocalAppDataNotDocuments()
-        {
-            string local = System.IO.Path.Combine("C:", "Users", "Admin", "AppData", "Local");
-            Assert.Equal(System.IO.Path.Combine(local, "ZoneKeeper", "webview2"), ResetRules.ProfileFolder(local));
         }
         [Fact]
         public void RetryWaitsGrowAndRespectRetryAfter()
@@ -510,15 +311,6 @@ namespace ZoneKeeper.Tests
             Assert.Equal(120000, ResetRules.RetryDelayMs(0, TimeSpan.FromMinutes(2)));
             Assert.Equal(3600000, ResetRules.RetryDelayMs(0, TimeSpan.FromDays(2)));
             Assert.Equal(5000, ResetRules.RetryDelayMs(0, TimeSpan.FromSeconds(-5)));
-        }
-        [Fact]
-        public void StatusTextsAreSimpleAndCountSeconds()
-        {
-            Assert.Equal("No answer from getzonekeeper.com. Check the internet. Trying again in 15 seconds.", UiText.ResetStatus(ResetView.NoAnswer, 15000));
-            Assert.Equal("", UiText.ResetStatus(ResetView.Page, 0));
-            foreach (ResetView view in Enum.GetValues(typeof(ResetView)))
-                if (view != ResetView.Page) Assert.NotEqual("", UiText.ResetStatus(view, 5000));
-            Assert.StartsWith("Reset window could not start (FileNotFoundException).", UiText.ResetStartFailed("FileNotFoundException"));
         }
     }
 }

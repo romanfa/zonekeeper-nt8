@@ -6,7 +6,7 @@ Works with NinjaTrader 8 (8.1 or newer) on Windows. A ZoneKeeper subscription wi
 
 **Development status:** Main `3b3404e` compiled and was tested on Windows on 2026-10-15 with NinjaTrader 8.1.8.3. The release 0.1.0 compiled ZIP is built. Clean installation and updates remain unverified. The GitHub repository is public since 2026-10-15 (read the code; install with the ZIP).
 
-Source 0.2.0 adds the automatic reset window (below) and the 0.1.1 text changes. It is not compiled in NinjaTrader yet: Step 0 and the Windows tests come first. The live ZIP below remains 0.1.0 until a new export is checked and uploaded.
+Source 0.2.0 adds the reset inside the ZoneKeeper window (below) and the 0.1.1 text changes. It is not compiled in NinjaTrader yet: the Windows tests come first. The live ZIP below remains 0.1.0 until a new export is checked and uploaded.
 
 ## Install the release ZIP
 
@@ -39,27 +39,28 @@ Local files live in `Documents\NinjaTrader 8\ZoneKeeper\` (the NinjaTrader user 
 | `outbox.jsonl` | Up to 500 closed trades waiting to send, with local fill provenance. The oldest is dropped, with a log entry, when full. |
 | `outbox.jsonl.invalidations` | Durable safety records that prevent corrected or removed fills from being uploaded again. |
 | `open-trades.json` | Pending closed trades, fill provenance and safety metadata for the outbox handoff. `open_trades` is always empty; saved open trades are ignored on load. |
+| `catalog.json` | The reset texts from the site (tilts, thoughts, Reprogram Logic lines, audio ids and marks) with their ETag. Refreshed every 6 hours. No audio inside. |
+| `resets.jsonl` | Up to 100 finished resets waiting to send. The oldest is dropped, with a log entry, when full. |
 | `zonekeeper.log`, `zonekeeper.1.log` | Event log and rotated log. Codes and device keys are not logged. |
 | `running.lock` | Keeps one engine active for this Windows user. |
 
-The reset window's browser profile (the site login cookie for this PC) is not in that folder: it lives in `%LOCALAPPDATA%\ZoneKeeper\webview2`, because OneDrive often syncs Documents and a synced browser profile breaks.
+The voice audio of a reset is never kept: it is downloaded for each reset into memory, written to one temp file `%TEMP%\ZoneKeeper\<guid>.mp3` only while it plays, and deleted right after. Leftovers from a crash are wiped when the engine starts and when the window opens.
 
 Offline trades wait locally and retry. If the subscription loses access, the key and waiting trades stay and the add-on checks again hourly. A disconnected PC needs a new code. Waiting trades belong to whichever ZoneKeeper account the PC connects to next. A key copied to another PC or Windows user cannot be decrypted; connect that PC separately.
 
 A closed trade is saved before it is sent. If a file cannot be saved, the add-on keeps it and tries again. If no save works, keep NinjaTrader open until it works.
 
-## Automatic reset (0.2.0)
+## Reset inside NinjaTrader (0.2.0)
 
-After each closed trade, a **ZoneKeeper Reset** window comes on top of the chart with the normal 5-tap reset for that trade. You click nothing to open it.
+The ZoneKeeper window has two tabs: **Today** and **Connection**. After each closed trade the window comes on top of the chart with today's trades and the 5-step reset for that trade. You click nothing to open it. No browser is involved: the tabs, buttons and progress bar are normal Windows controls.
 
-- It opens only for a trade that closed in the last 10 minutes, during this NinjaTrader run. No pop-up after a NinjaTrader restart or for trades sent late; they still show on Today with a Reset button.
-- It never takes the keyboard focus: your hotkeys and Chart Trader clicks still go to NinjaTrader. Your first click into the window activates it.
-- One window for all trades. A new trade while it is open goes into the same window (the page decides when to show it). Closing the window = skip this reset.
-- Turn it off with **Open the reset after each closed trade** in the ZoneKeeper window (on by default, `auto_reset` in `settings.json`). **Open reset window** opens it by hand.
-- Login: the add-on asks `POST /api/nt/handoff` (device key) for a one-use key that works for 60 seconds. The window sends it with `POST /auth/addon?trade=<id>` (header `X-ZK-Handoff` and form field `h`, never in the link) and gets the normal cabinet login for this PC. The device key never goes into the browser, a link or the page. Disconnect ends that login.
-- No answer from the site: the window stays and tries again after 5 s, 15 s, 30 s, then every 60 s. Plan not active: it says so and does not try again by itself. PC disconnected: the window closes. Trade sending never waits for the window.
-- Needs the Microsoft Edge WebView2 Runtime (NinjaTrader's installer adds it) and the WebView2 DLLs: NinjaTrader's own copy (path N) or SDK `1.0.4258.31` files in `bin\Custom` (path S, `tools\get-webview2.ps1`). Step 0 on Windows decides which. The code compiles with WebView2 SDK 1.0.902.49 or newer.
-- Needs the site to send `ids` in the `POST /api/nt/trades` answer and to have `POST /api/nt/handoff` and `POST /auth/addon`. An older site: no window, one log line.
+- **Today tab:** today's trades, newest first (`10:12 · ES 12-26 · Short 2 · +212.50`), each with `Reset`, `Saving…` or `Logged`. The list refreshes every 30 seconds while the tab is shown, and after every sent trade.
+- **The 5 steps:** Rate your tilt (1–10) → What happened (from the P/L: stop loss, winning trade, break-even) → What you feel (one thought) → Reprogram Logic (one line; the voice plays) → Rate tilt again. The last tap saves the reset; there is no Done button. `Back to today` closes the reset early and saves nothing. Tilt 7 or higher at step 1 shows the red line: `Stop for today` or `Do a reset anyway`.
+- **Voice:** downloaded for each reset with the device key (`GET /api/nt/audio/<id>`), played from one temp file, deleted after it plays. No internet → `Audio needs a connection. The reset runs with the timer.` Plan not active → the reset closes with the plan text. `Skip audio` goes to step 5 at once.
+- **Raise rule:** only for a trade that closed in the last 10 minutes, during this NinjaTrader run, when **Open the reset after each closed trade** is on (default; `auto_reset` in `settings.json`). The window never takes the keyboard focus by itself. A running reset is never interrupted: the new trade shows as `new` in the list. No pop-up after a NinjaTrader restart; the trade still shows with `Reset`.
+- **Saving:** the finished reset goes into `resets.jsonl` and is sent after the trades (`POST /api/nt/resets`). Already done on the phone → `Logged`, one log line. Refused by the server → the row goes back to `Reset`, one log line. Offline → it waits.
+- **Routes used:** `GET /api/nt/catalog` (texts, ETag, every 6 hours), `GET /api/nt/today?date=YYYY-MM-DD`, `GET /api/nt/audio/<id>`, `POST /api/nt/resets`, plus ping, trades, claim and disconnect. All with the device key in the `Authorization` header, never in a link. All in the site's `nt` limit (600 calls per hour).
+- The window place is saved in `settings.json` under `window`.
 
 See the [ZoneKeeper privacy policy](https://getzonekeeper.com/privacy/).
 
@@ -78,7 +79,7 @@ Roman owns all NinjaTrader actions and Sim101 orders. Use **only `https://getzon
    ```
 
 4. **Close NinjaTrader.** Run `& .\tools\link-dev.ps1`. **Start NinjaTrader again.** The script refuses to run while NinjaTrader is open. It creates a junction from the Windows Documents folder's `NinjaTrader 8\bin\Custom\AddOns\ZoneKeeper` to `C:\dev\zonekeeper-nt8\src\ZoneKeeper`. Confirm the files appear in NinjaScript Editor → AddOns → ZoneKeeper. If a folder already exists there, stop and inspect it before proceeding.
-5. In NinjaScript Editor → right-click → References, check `System.Net.Http`, `System.Security` and `System.Runtime.Serialization`. From 0.2.0 also `Microsoft.Web.WebView2.Core` and `Microsoft.Web.WebView2.Wpf` (from NinjaTrader's `bin` in path N, from `bin\Custom` in path S). Add missing references from `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\` before the first F5 compile. If `NinjaTrader.Custom.dll` is not rebuilt, the references are missing; the trace may have no compile lines.
+5. In NinjaScript Editor → right-click → References, check `System.Net.Http`, `System.Security` and `System.Runtime.Serialization`. Nothing else is needed (0.2.0 uses no browser DLL). Add missing references from `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\` before the first F5 compile. If `NinjaTrader.Custom.dll` is not rebuilt, the references are missing; the trace may have no compile lines.
 6. Run the pure tests and read the last 30 log lines:
 
    ```powershell
@@ -122,7 +123,7 @@ The release 0.1.0 compiled ZIP was built and checked on Windows on 2026-10-15. F
 2. Control Center → Tools → Export → NinjaScript… → **Export as compiled assembly**. Leave **Protect compiled assembly** unchecked. Select **all** source files under AddOns → ZoneKeeper; compare the export list with `src\ZoneKeeper\*.cs`. The export file name must be exactly **`ZoneKeeper`** (confirmed on Windows).
 3. Set Product `ZoneKeeper`, Version `0.2.0`, and export file name **`ZoneKeeper`**. Keep this name for every version so updates do not load a second assembly.
 4. Inspect `Documents\NinjaTrader 8\bin\Custom\ExportNinjaScript\ZoneKeeper.zip`: require one `ZoneKeeper.dll`, `Info.xml`, and the small NT-generated `ZoneKeeper.cs` stub (1143 bytes, no real source code).
-5. Copy the same bytes to `dist\ZoneKeeper-NT8-0.2.0.zip` and `dist\ZoneKeeper-NT8.zip` (path S: `tools\pack-zip.ps1` does this and adds the 3 WebView2 files). Run `tools\checksum.ps1`; confirm both hashes in `dist\SHA256SUMS.txt` match. For the site handoff, also copy the ZIP to `C:\Users\Admin\Documents\Vault\Home\Trading\ZoneKeeper\ZoneKeeper-NT8.zip`.
+5. Copy the same bytes to `dist\ZoneKeeper-NT8-0.2.0.zip` and `dist\ZoneKeeper-NT8.zip`. Run `tools\checksum.ps1`; confirm both hashes in `dist\SHA256SUMS.txt` match. For the site handoff, also copy the ZIP to `C:\Users\Admin\Documents\Vault\Home\Trading\ZoneKeeper\ZoneKeeper-NT8.zip`.
 6. Complete G12 and G13 before release. For the clean install, **close NinjaTrader → run `tools/unlink-dev.ps1` → start NinjaTrader again** before importing the ZIP; follow G12 for restoring the development junction. Making the repository public, tagging/publishing a release and hosting the ZIP on the site remain separate coordinator/owner actions. This documentation does not publish or change the site.
 
 The final 0.1.0 ZIP is 224013 bytes; SHA256 `702d472f160d86040dc0ed4e462bfc1f9df5b9b4327c2452dbbfa139a772bc8c`. `ZoneKeeper.dll` is 755200 bytes. The same ZIP is available at [the live download address](https://getzonekeeper.com/downloads/ZoneKeeper-NT8.zip).

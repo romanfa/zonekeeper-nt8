@@ -3,7 +3,6 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using NinjaTrader.Cbi;
@@ -94,50 +93,16 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             catch (Exception) { }
         }
         public static bool Running { get { var run = ActiveRun(); return run != null && !run.Stopping && run.session != null; } }
-        // The reset window asks for its one-use login key here. HTTP runs on the thread pool, never on the UI thread.
-        public static Task<HandoffResult> HandoffAsync()
-        {
-            var run = ActiveRun();
-            if (run == null || run.Stopping || run.session == null) return Task.FromResult(HandoffResult.Of(HandoffStatus.Offline));
-            return Task.Run(async () => {
-                try { return await run.session.HandoffAsync(Helpers.NowMs(), run.Cancellation).ConfigureAwait(false); }
-                catch (Exception) { return HandoffResult.Of(HandoffStatus.Offline); }
-            });
-        }
-        // Button "Open reset window": file and settings reads happen on the thread pool.
-        public static void OpenResetWindow()
-        {
-            var run = ActiveRun();
-            if (run == null || run.Stopping) return;
-            Task.Run(() => run.RequestReset(0, true));
-        }
-        public static void CloseResetWindow() { CloseReset(); }
         public static Task SetAutoResetAsync(bool on)
         {
             var run = ActiveRun();
             return run == null ? Task.FromResult(0) : Task.Run(() => run.SetAutoReset(on));
         }
-        public static void SaveResetBounds(WindowBounds bounds)
+        public static void SaveWindowBounds(WindowBounds bounds)
         {
             var run = ActiveRun();
-            if (run != null) Task.Run(() => run.SaveResetBounds(bounds));
+            if (run != null) Task.Run(() => run.SaveWindowBounds(bounds));
         }
-        // The reset window needs the WebView2 DLLs. If they are missing, .NET fails while it compiles a method
-        // that uses ResetWindow. These small NoInlining helpers keep that failure inside a try/catch here.
-        private static void ShowReset(long tradeId, ResetOpen open, bool activate)
-        {
-            try { ShowResetCore(tradeId, open, activate); }
-            catch (Exception ex) { Note(UiText.ResetStartFailed(ex.GetType().Name)); }
-        }
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        private static void ShowResetCore(long tradeId, ResetOpen open, bool activate) { ResetWindow.Request(tradeId, open, activate); }
-        private static void CloseReset()
-        {
-            try { CloseResetCore(); }
-            catch (Exception) { }
-        }
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        private static void CloseResetCore() { ResetWindow.CloseIfOpen(); }
 
         private sealed class Run
         {
@@ -174,7 +139,6 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             public void BeginStop()
             {
                 stopping = true;
-                CloseReset();
                 cancel.Cancel();
                 if (watcher != null) watcher.Stop();
                 work.CompleteAdding();
@@ -252,18 +216,6 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     return executions;
                 });
             }
-            public void RequestReset(long tradeId, bool activate)
-            {
-                try
-                {
-                    if (stopping || settings == null) return;
-                    var open = new ResetOpen { BaseUrl = settings.BaseUrl, Bounds = settings.ResetWindow,
-                        UserDataFolder = ResetRules.ProfileFolder(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)),
-                        LoaderFolder = ResetRules.LoaderFolder(Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "bin", "Custom"), File.Exists) };
-                    ShowReset(tradeId, open, activate);
-                }
-                catch (Exception ex) { log.Error("Could not open the reset window", ex); }
-            }
             public void SetAutoReset(bool on)
             {
                 // Never write settings while stopping: after F5 the new engine owns the file.
@@ -271,9 +223,9 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 catch (Exception ex) { log.Error(UiText.SaveFailed, ex); }
                 Publish();
             }
-            public void SaveResetBounds(WindowBounds bounds)
+            public void SaveWindowBounds(WindowBounds bounds)
             {
-                try { if (!stopping && settings != null) settings.SetResetWindow(bounds); }
+                try { if (!stopping && settings != null) settings.SetWindowBounds(bounds); }
                 catch (Exception ex) { log.Error(UiText.SaveFailed, ex); }
             }
             public void SetAccounts(List<AccountChoice> choices)
@@ -349,8 +301,6 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                             api = new ApiClient(settings.BaseUrl, log.ProtectSecret);
                             session = new SessionCoordinator(settings, outbox, api, log) { RunStartedMs = Helpers.NowMs() };
                             session.Changed += Publish; session.WorkAvailable += Wake;
-                            session.ResetWanted += id => { if (!stopping) RequestReset(id, false); };
-                            session.KeyRemoved += CloseReset;
                             outbox.DurableAdded += trade => { log.TradeClosed(trade); session.NotifyQueued(); };
                             outbox.ReadyToSend += session.NotifyQueued;
                             break;
@@ -376,7 +326,6 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 finally
                 {
                     BeginStop();
-                    CloseReset();
                     if (fillTask != null) try { await fillTask.ConfigureAwait(false); } catch (Exception) { }
                     if (senderTask != null) try { await senderTask.ConfigureAwait(false); } catch (Exception) { }
                     if (session != null) await session.QuiesceAsync().ConfigureAwait(false);

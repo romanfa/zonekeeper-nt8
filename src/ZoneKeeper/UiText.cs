@@ -22,39 +22,11 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public const string SaveFailed = "Could not save a ZoneKeeper file. We try again soon.";
         public const string AccountSaved = "Saved. You can close this window.";
         public const string DisconnectConfirm = "Disconnect this PC from ZoneKeeper? NinjaTrader stops sending trades. To connect again, you need a new code.";
-        // Reset window (0.2.0). L1-L5 are the log lines from plan note 29.
+        // Reset inside the window (0.2.0).
         public const string AutoResetLabel = "Open the reset after each closed trade";
-        public const string OpenResetButton = "Open reset window";
         public const string ResetTitle = "Reset after a trade";
-        public const string ResetRuntimeMissing = "Reset window: Microsoft Edge WebView2 Runtime is missing. Install it, then restart NinjaTrader.";
-        public const string ResetLoginFailed = "Reset window: could not log in. Try \"Open reset window\" again.";
-        public const string ResetUnsupported = "The site does not support the reset window yet.";
-        public const string ResetNoAnswer = "Reset window: no answer from getzonekeeper.com. It tries again by itself.";
         public static string ResetOpened(long exitMs)
         { return "Opened the reset for the trade closed at " + DateTimeOffset.FromUnixTimeMilliseconds(exitMs).ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture) + "."; }
-        public static string ResetStartFailed(string typeName)
-        { return "Reset window could not start (" + Helpers.Cut(typeName, 80) + "). Trades are still sent."; }
-        public static string ResetBrowserHiccup(string kind)
-        { return "Reset window: a browser part stopped or hung (" + Helpers.Cut(kind, 80) + "). The window stays open."; }
-        public static string ResetBrowserStopped(string kind)
-        { return "Reset window: the browser stopped (" + Helpers.Cut(kind, 80) + "). The window closed. Trades are still sent."; }
-        public static string ResetStatus(ResetView view, long retryMs)
-        {
-            switch (view)
-            {
-                case ResetView.Starting: return "Starting the browser…";
-                case ResetView.Opening: return "Opening your reset…";
-                case ResetView.NoAnswer:
-                    return "No answer from getzonekeeper.com. Check the internet. Trying again in " +
-                        Math.Max(1, (retryMs + 999) / 1000).ToString(CultureInfo.InvariantCulture) + " seconds.";
-                case ResetView.NotPaid: return "Your ZoneKeeper plan is not active. Renew it on getzonekeeper.com, then click \"Open reset window\" in ZoneKeeper.";
-                case ResetView.ConnectFirst: return "Connect this PC first: Control Center → New → ZoneKeeper, then paste a code.";
-                case ResetView.LoginFailed: return "Could not log in. Click \"Open reset window\" in ZoneKeeper to try again.";
-                case ResetView.Unsupported: return ResetUnsupported;
-                case ResetView.BrowserFailed: return "The browser could not start. Trades are still sent. You can close this window.";
-                default: return "";
-            }
-        }
         public static string Status(ZkStatus status, string email, long nextTryMs)
         {
             switch (status)
