@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0 — source ready 2026-10-19
+
+Not compiled in NinjaTrader yet. Step 0 (which WebView2 DLLs NinjaTrader has) and the Windows tests come first. Includes the 0.1.1 changes.
+
+- Automatic reset: after a closed trade (exit at most 10 minutes ago, during this NinjaTrader run) one reused "ZoneKeeper Reset" window opens on top of the chart without taking the keyboard focus. Closing it = skip.
+- Checkbox "Open the reset after each closed trade" (on by default) and button "Open reset window".
+- Reads the trade `ids` from the `POST /api/nt/trades` answer; gets a one-use login key from `POST /api/nt/handoff`. The device key never enters the browser.
+- No answer: the window stays and tries again with growing waits. Plan not active: it says so, no retry loop. Disconnect, F5 and NinjaTrader exit close the window.
+- Step 0 probe (`probes/BrowserProbe`) and path S tools (`tools/get-webview2.ps1`, `tools/pack-zip.ps1`).
+
 ## 0.1.1 — source ready 2026-10-16
 
 Windows compile and ZIP export are pending. The live download is still 0.1.0.

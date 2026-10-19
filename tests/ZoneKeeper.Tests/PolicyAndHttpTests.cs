@@ -88,7 +88,7 @@ namespace ZoneKeeper.Tests
         {
             var handler = new FakeHttp();
             handler.Send = async (request, cancellation) => {
-                Assert.Equal("ZoneKeeper-NT8/0.1.1", request.Headers.UserAgent.ToString()); Assert.Contains("0.1.1", request.Headers.GetValues("X-ZK-Addon-Version"));
+                Assert.Equal("ZoneKeeper-NT8/0.2.0", request.Headers.UserAgent.ToString()); Assert.Contains("0.2.0", request.Headers.GetValues("X-ZK-Addon-Version"));
                 Assert.Equal(Helpers.LiveBaseUrl, request.RequestUri.GetLeftPart(UriPartial.Authority));
                 if (request.RequestUri.AbsolutePath == "/api/device/claim")
                 {
