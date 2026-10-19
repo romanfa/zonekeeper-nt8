@@ -31,18 +31,31 @@ namespace ZoneKeeper.Tests
             public readonly MemoryFiles Files = new MemoryFiles();
             public readonly FakeApi Api = new FakeApi();
             public readonly OutboxQueue Queue;
+            public readonly ResetOutbox Resets;
             public readonly Settings Settings;
             public readonly SessionCoordinator Session;
             public readonly EventLog Log;
             public readonly List<long> Opened = new List<long>();
+            public readonly List<string> Saved = new List<string>();  // "812:logged" / "812:refused"
             public int KeyRemoved;
             public Scope(bool connected = true, long runStartedMs = 0)
             {
                 Settings = Fixtures.Settings(Files, connected); Queue = new OutboxQueue("queue", Files, delegate { }); Log = new EventLog(Folder.Path);
-                Session = new SessionCoordinator(Settings, Queue, Api, Log) { RunStartedMs = runStartedMs };
+                Resets = new ResetOutbox("resets", Files, Log.Write);
+                Session = new SessionCoordinator(Settings, Queue, Resets, Api, Log) { RunStartedMs = runStartedMs };
                 Queue.DurableAdded += delegate { Session.NotifyQueued(); };
                 Session.ResetWanted += id => Opened.Add(id);
+                Session.ResetSaved += (id, logged) => Saved.Add(id + (logged ? ":logged" : ":refused"));
                 Session.KeyRemoved += () => KeyRemoved++;
+            }
+            // The step-5 tap of the window: the body goes into resets.jsonl and the sender is woken.
+            public ResetBody QueueReset(long tradeId, long exitMs)
+            {
+                var session = new ResetSession(Fixtures.Catalog(), Fixtures.TodayTrade(tradeId, -1250, exitMs), TimeZoneInfo.Utc);
+                session.RateBefore(5, exitMs + 60000); session.PickThought(session.Thoughts[0]); session.PickLine(session.Thought.Lines[1]); session.FinishAudio();
+                var body = session.RateAgain(3, exitMs + 240000);
+                Assert.True(Resets.Add(body, exitMs, exitMs + 240000)); Session.NotifyQueued();
+                return body;
             }
             public Task Step(long now) { return Session.ProcessAsync(now, CancellationToken.None); }
             // Ping once, then send the given trades in one batch at "now" with the given answer.
@@ -303,6 +316,160 @@ namespace ZoneKeeper.Tests
             Assert.Equal(1440, ResetRules.Place(new WindowBounds { Left = 100, Top = 1070, Width = 500, Height = 900 }, screen, work).Left);
             // Small work area: the height fits it.
             Assert.Equal(700, ResetRules.Place(null, screen, new WindowBounds { Left = 0, Top = 0, Width = 1280, Height = 700 }).Height);
+        }
+        // R9: a finished reset is sent after the trades (plan 31 section 2.5).
+        [Fact]
+        public async Task R9_AQueuedResetIsSentAfterTheTradesBatchWithTheExactBody()
+        {
+            using (var s = new Scope())
+            {
+                await s.Step(Fixtures.Time);
+                var trade = Fixtures.Trade(); long now = trade.ExitTime + 60000;
+                var body = s.QueueReset(812, trade.ExitTime);
+                s.Queue.Add(trade);
+                Assert.Equal(0, s.Session.Snapshot().NextTryMs);
+                Assert.Equal(new long[] { 812 }, s.Session.Snapshot().SavingTradeIds.ToArray());
+                await s.Step(now);
+                Assert.Equal(new[] { "ping", "trades", "reset" }, s.Api.Order.ToArray());
+                Assert.Equal(Json.Write(body), Json.Write(s.Api.ResetBodies[0]));
+                Assert.Equal(0, s.Resets.Count); Assert.Equal(0, s.Queue.Count); Assert.Empty(s.Session.Snapshot().SavingTradeIds);
+                Assert.Equal(new[] { "812:logged" }, s.Saved.ToArray());
+                Assert.Contains(s.Log.Recent, x => x.Contains("Reset saved for the trade closed at"));
+                Assert.Equal(ZkStatus.Connected, s.Session.Snapshot().Status); Assert.Equal(now + 300000, s.Session.Snapshot().NextTryMs);
+                Assert.Equal(now, s.Session.Snapshot().LastSentMs);
+            }
+        }
+        [Fact]
+        public async Task R9_ResetsGoWithoutAPingAndOnePerLoopOldestFirst()
+        {
+            using (var s = new Scope())
+            {
+                await s.Step(Fixtures.Time);
+                s.QueueReset(812, Fixtures.Time - 500000); s.QueueReset(813, Fixtures.Time - 100000);
+                await s.Step(Fixtures.Time);
+                Assert.Equal(new[] { "ping", "reset" }, s.Api.Order.ToArray()); Assert.Equal(812, s.Api.ResetBodies[0].TradeId);
+                Assert.Equal(1, s.Resets.Count); Assert.Equal(Fixtures.Time, s.Session.Snapshot().NextTryMs);  // the next loop runs at once
+                await s.Step(Fixtures.Time);
+                Assert.Equal(new[] { "ping", "reset", "reset" }, s.Api.Order.ToArray()); Assert.Equal(813, s.Api.ResetBodies[1].TradeId);
+                Assert.Equal(0, s.Resets.Count); Assert.Equal(new[] { "812:logged", "813:logged" }, s.Saved.ToArray());
+            }
+        }
+        [Fact]
+        public async Task R9_409MeansDoneElsewhereAndNoRetry()
+        {
+            using (var s = new Scope())
+            {
+                await s.Step(Fixtures.Time);
+                s.QueueReset(812, Fixtures.Time - 100000);
+                s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.AlreadyDone, Status = 409, Error = "this trade already has a reset" });
+                await s.Step(Fixtures.Time);
+                Assert.Equal(0, s.Resets.Count); Assert.Equal(1, s.Api.Resets); Assert.Equal(new[] { "812:logged" }, s.Saved.ToArray());
+                Assert.Contains(s.Log.Recent, x => x.EndsWith(UiText.ResetDoneElsewhere, StringComparison.Ordinal));
+                Assert.DoesNotContain(s.Log.Recent, x => x.Contains("Reset saved"));
+                await s.Step(Fixtures.Time + 300000);
+                Assert.Equal(1, s.Api.Resets); Assert.Equal(ZkStatus.Connected, s.Session.Snapshot().Status);
+            }
+        }
+        [Fact]
+        public async Task R9_400IsDroppedWithOneLogLineAndMarksTheCatalogStaleWhenTextsChanged()
+        {
+            using (var s = new Scope())
+            {
+                await s.Step(Fixtures.Time);
+                s.QueueReset(812, Fixtures.Time - 100000);
+                s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.BadRequest, Status = 400, Error = "local time is too far from now" });
+                await s.Step(Fixtures.Time);
+                Assert.Equal(0, s.Resets.Count); Assert.Equal(new[] { "812:refused" }, s.Saved.ToArray());
+                Assert.Equal(1, s.Log.Recent.Count(x => x.EndsWith("The server refused this reset: local time is too far from now", StringComparison.Ordinal)));
+                Assert.False(s.Session.TakeCatalogStale()); Assert.Equal(ZkStatus.Connected, s.Session.Snapshot().Status);
+                await s.Step(Fixtures.Time + 300000);
+                Assert.Equal(1, s.Api.Resets);
+                s.QueueReset(813, Fixtures.Time - 50000);
+                s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.BadRequest, Status = 400, Error = "logic_id does not fit the thought" });
+                await s.Step(Fixtures.Time + 300000);
+                Assert.True(s.Session.TakeCatalogStale()); Assert.False(s.Session.TakeCatalogStale());
+                Assert.Equal(new[] { "812:refused", "813:refused" }, s.Saved.ToArray());
+            }
+        }
+        [Fact]
+        public async Task R9_OfflineKeepsTheLineAndTradeSendingGoesOnLater()
+        {
+            using (var s = new Scope())
+            {
+                await s.Step(Fixtures.Time);
+                var body = s.QueueReset(812, Fixtures.Time - 100000);
+                s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.Offline, Error = "No answer from getzonekeeper.com." });
+                await s.Step(Fixtures.Time);
+                Assert.Equal(1, s.Resets.Count); Assert.Empty(s.Saved); Assert.Equal(ZkStatus.Offline, s.Session.Snapshot().Status);
+                Assert.Equal(Fixtures.Time + 15000, s.Session.Snapshot().NextTryMs);
+                // At the next try: the ping first (Offline → Connected); a waiting trade keeps the reset back.
+                s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.TooMany, Status = 429 });
+                s.Queue.Add(Fixtures.Trade()); await s.Step(Fixtures.Time + 15000);
+                Assert.Equal(0, s.Api.Sends); Assert.Equal(1, s.Api.Resets); Assert.Equal(ZkStatus.Connected, s.Session.Snapshot().Status); Assert.Equal(Fixtures.Time + 15000, s.Session.Snapshot().NextTryMs);
+                // Then the trade goes, then the reset is tried again with the same request_id (429 → Offline again).
+                await s.Step(Fixtures.Time + 15000);
+                Assert.Equal(1, s.Api.Sends); Assert.Equal(0, s.Queue.Count); Assert.Equal(new[] { "ping", "reset", "ping", "trades", "reset" }, s.Api.Order.ToArray());
+                Assert.Equal(2, s.Api.Resets); Assert.Equal(body.RequestId, s.Api.ResetBodies[1].RequestId); Assert.Equal(1, s.Resets.Count);
+                Assert.Equal(ZkStatus.Offline, s.Session.Snapshot().Status); Assert.Equal(Fixtures.Time + 15000 + 60000, s.Session.Snapshot().NextTryMs);
+                await s.Step(Fixtures.Time + 75000);
+                Assert.Equal(3, s.Api.Resets); Assert.Equal(0, s.Resets.Count); Assert.Equal(new[] { "812:logged" }, s.Saved.ToArray());
+                Assert.Equal(body.RequestId, s.Api.ResetBodies[2].RequestId);
+            }
+        }
+        [Fact]
+        public async Task R9_401DeletesTheKeyAnd403PausesTheLineWaits()
+        {
+            using (var s = new Scope())
+            {
+                await s.Step(Fixtures.Time);
+                s.QueueReset(812, Fixtures.Time - 100000);
+                s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.NotPaid, Status = 403, Error = "not_paid" });
+                await s.Step(Fixtures.Time);
+                Assert.Equal(1, s.Resets.Count); Assert.Equal(ZkStatus.Paused, s.Session.Snapshot().Status); Assert.Equal(Fixtures.Time + 3600000, s.Session.Snapshot().NextTryMs);
+                s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.NotConnected, Status = 401, Error = "not_connected" });
+                await s.Step(Fixtures.Time + 3600000);
+                Assert.Null(s.Settings.Token); Assert.Equal(1, s.KeyRemoved); Assert.Equal(ZkStatus.NotConnected, s.Session.Snapshot().Status);
+                Assert.Equal(1, s.Resets.Count); Assert.Empty(s.Saved);
+            }
+        }
+        [Fact]
+        public async Task R9_ADiskErrorOnRemoveTriesAgainLaterAndAThrowingHandlerNeverStopsSending()
+        {
+            using (var s = new Scope())
+            {
+                await s.Step(Fixtures.Time);
+                s.Session.ResetSaved += (id, logged) => { throw new InvalidOperationException("list broke"); };
+                s.QueueReset(812, Fixtures.Time - 100000); s.QueueReset(813, Fixtures.Time - 50000);
+                s.Files.FailWrites = path => path == "resets";
+                await s.Step(Fixtures.Time);
+                Assert.Equal(1, s.Api.Resets); Assert.Equal(2, s.Resets.Count); Assert.Empty(s.Saved); Assert.Equal(ZkStatus.Offline, s.Session.Snapshot().Status);
+                s.Files.FailWrites = null;
+                // Offline → the ping first, then the same reset again (same request_id = the same row on the site), then the next.
+                await s.Step(Fixtures.Time + 15000); await s.Step(Fixtures.Time + 15000);
+                Assert.Equal(3, s.Api.Resets); Assert.Equal(s.Api.ResetBodies[0].RequestId, s.Api.ResetBodies[1].RequestId);
+                Assert.Equal(0, s.Resets.Count); Assert.Equal(new[] { "812:logged", "813:logged" }, s.Saved.ToArray());
+                Assert.Contains(s.Log.Recent, x => x.Contains("Could not update the Today list (InvalidOperationException)"));
+                Assert.Equal(ZkStatus.Connected, s.Session.Snapshot().Status);
+            }
+        }
+        [Fact]
+        public async Task R9_NothingIsSentWhileNotConnectedOrPaused()
+        {
+            using (var s = new Scope(connected: false))
+            {
+                s.QueueReset(812, Fixtures.Time - 100000);
+                await s.Step(Fixtures.Time);
+                Assert.Equal(0, s.Api.Resets); Assert.Equal(1, s.Resets.Count); Assert.Equal(new long[] { 812 }, s.Session.Snapshot().SavingTradeIds.ToArray());
+            }
+            using (var s = new Scope())
+            {
+                s.Api.PingAnswers.Enqueue(new ApiResult { Kind = ApiKind.NotPaid, Status = 403, Error = "not_paid" });
+                await s.Step(Fixtures.Time);
+                Assert.Equal(ZkStatus.Paused, s.Session.Snapshot().Status);
+                s.QueueReset(812, Fixtures.Time - 100000);
+                await s.Step(Fixtures.Time + 1000);
+                Assert.Equal(0, s.Api.Resets); Assert.Equal(1, s.Resets.Count);
+            }
         }
         [Fact]
         public void RetryWaitsGrowAndRespectRetryAfter()

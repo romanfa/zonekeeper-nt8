@@ -8,11 +8,15 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
 {
     public static class Json
     {
+        // Simple dictionary format: a Dictionary<string, T> is a plain JSON object ({"b1": {...}}), as the site writes it.
+        private static DataContractJsonSerializer For<T>()
+        { return new DataContractJsonSerializer(typeof(T), new DataContractJsonSerializerSettings { UseSimpleDictionaryFormat = true }); }
+
         public static string Write<T>(T value)
         {
             using (var stream = new MemoryStream())
             {
-                new DataContractJsonSerializer(typeof(T)).WriteObject(stream, value);
+                For<T>().WriteObject(stream, value);
                 return Encoding.UTF8.GetString(stream.ToArray());
             }
         }
@@ -20,7 +24,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public static T Read<T>(string text)
         {
             using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(text)))
-                return (T)new DataContractJsonSerializer(typeof(T)).ReadObject(stream);
+                return (T)For<T>().ReadObject(stream);
         }
 
         public static bool TryRead<T>(string text, out T value)

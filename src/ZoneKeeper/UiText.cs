@@ -27,6 +27,58 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public const string ResetTitle = "Reset after a trade";
         public static string ResetOpened(long exitMs)
         { return "Opened the reset for the trade closed at " + DateTimeOffset.FromUnixTimeMilliseconds(exitMs).ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture) + "."; }
+        public static string ResetSaved(long exitMs)
+        { return "Reset saved for the trade closed at " + DateTimeOffset.FromUnixTimeMilliseconds(exitMs).ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture) + "."; }
+        public const string ResetDoneElsewhere = "Already done on another device.";
+        public static string ResetRefused(string error) { return "The server refused this reset: " + Helpers.Cut(error, 160); }
+        public const string ResetQueueFull = "Waiting list of resets is full (100). The oldest was dropped.";
+        public static string AudioLoading(int percent) { return "Loading audio… " + Math.Max(0, Math.Min(100, percent)).ToString(CultureInfo.InvariantCulture) + " %"; }
+        public const string AudioNeedsConnection = "Audio needs a connection. The reset runs with the timer.";
+        public const string AudioNotPaid = "Your ZoneKeeper plan is not active. Renew it on getzonekeeper.com.";
+        public const string AudioFailed = "The voice could not play. The reset runs with the timer.";
+        public const string CatalogLoading = "Loading the reset texts…";
+        public const string NoTradesToday = "No trades today.";
+        // Button labels and tags of the Today tab. All content texts (tilts, thoughts, lines, parts, rule lines) come from the catalog.
+        public const string TabToday = "Today";
+        public const string TabConnection = "Connection";
+        public const string RefreshButton = "Refresh";
+        public const string ResetButton = "Reset";
+        public const string LoggedTag = "Logged";
+        public const string SavingTag = "Saving…";
+        public const string NewTag = "new";
+        public const string BackToToday = "Back to today";
+        public const string StopForToday = "Stop for today";
+        public const string ResetAnyway = "Do a reset anyway";
+        public const string SkipAudio = "Skip audio";
+        public const string PauseButton = "Pause";
+        public const string ResumeButton = "Resume";
+        public const string YourLogic = "Your Reprogram Logic";
+        public static readonly string[] StepNames = { "Rate your tilt", "What happened", "What you feel", "Reprogram Logic", "Rate tilt again" };
+        public static string StepLine(int step)
+        {
+            int i = Math.Max(1, Math.Min(StepNames.Length, step));
+            return "Step " + i.ToString(CultureInfo.InvariantCulture) + " of 5 — " + StepNames[i - 1];
+        }
+        public static string WhatHappened(string triggerLabel) { return "What happened: " + triggerLabel; }
+        public static string TiltChoice(int n, string name) { return n.ToString(CultureInfo.InvariantCulture) + " · " + name; }
+        public static string TiltTip(int n, string name, string feel) { return TiltChoice(n, name) + (string.IsNullOrEmpty(feel) ? "" : " — " + feel); }
+        public static string PartLine(int index, int count, string name)
+        { return "Part " + (index + 1).ToString(CultureInfo.InvariantCulture) + " of " + count.ToString(CultureInfo.InvariantCulture) + " · " + name; }
+        public static string RoundLine(int round)
+        { return round <= 0 ? "Get ready." : "Round " + round.ToString(CultureInfo.InvariantCulture) + " of " + TodayRules.BreathRounds.ToString(CultureInfo.InvariantCulture); }
+        // The short status line on top of the Today tab.
+        public static string TodayStatus(ZkStatus status, string email)
+        {
+            switch (status)
+            {
+                case ZkStatus.Checking: return Checking;
+                case ZkStatus.Connected: return "Connected to " + email;
+                case ZkStatus.Paused: return "Paused: your plan is not active.";
+                case ZkStatus.Offline: return "Offline: trades and resets wait here.";
+                case ZkStatus.OtherInstance: return OtherInstance;
+                default: return "Not connected — open the Connection tab.";
+            }
+        }
         public static string Status(ZkStatus status, string email, long nextTryMs)
         {
             switch (status)

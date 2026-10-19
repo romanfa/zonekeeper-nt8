@@ -10,7 +10,7 @@ using System.Text.RegularExpressions;
 namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
 {
     public enum ZkStatus { NotConnected, Checking, Connected, Paused, Offline, OtherInstance }
-    public enum ApiKind { Ok, NotConnected, NotPaid, CodeInvalid, TooManyDevices, TooManyTries, TooMany, BadRequest, Offline }
+    public enum ApiKind { Ok, NotConnected, NotPaid, CodeInvalid, TooManyDevices, TooManyTries, TooMany, BadRequest, AlreadyDone, Offline }
 
     public static class Helpers
     {
@@ -78,6 +78,16 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public static string LocalDate(long ms, TimeZoneInfo zone)
         {
             return TimeZoneInfo.ConvertTime(DateTimeOffset.FromUnixTimeMilliseconds(ms), zone).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        }
+        public static string LocalDateNow(TimeZoneInfo zone) { return LocalDate(NowMs(), zone); }
+        // The site's "local" stamp: the member's clock as YYYY-MM-DDTHH:MM, no seconds, no zone.
+        public static string LocalStamp(long ms, TimeZoneInfo zone)
+        {
+            return TimeZoneInfo.ConvertTime(DateTimeOffset.FromUnixTimeMilliseconds(ms), zone).ToString("yyyy-MM-dd'T'HH:mm", CultureInfo.InvariantCulture);
+        }
+        public static string LocalClock(long ms, TimeZoneInfo zone)
+        {
+            return TimeZoneInfo.ConvertTime(DateTimeOffset.FromUnixTimeMilliseconds(ms), zone).ToString("HH:mm", CultureInfo.InvariantCulture);
         }
     }
 
@@ -344,5 +354,132 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         // Typed body: callers never need to retain or log the raw response JSON.
         public object Body { get; set; }
         public TimeSpan? RetryAfter { get; set; }
+        // Catalog answer: the ETag header, sent back as If-None-Match next time.
+        public string ETag { get; set; }
+        // Audio answer: the Content-Length header, for the size check.
+        public long? ContentLength { get; set; }
+    }
+
+    // ---- The reset catalog (GET /api/nt/catalog, plan 31 section 2.2). Texts only, never audio. ----
+    [DataContract] public sealed class Catalog
+    {
+        [DataMember(Name = "version")] public string Version { get; set; }
+        [DataMember(Name = "rules")] public CatalogRules Rules { get; set; }
+        [DataMember(Name = "tilts")] public List<CatalogTilt> Tilts { get; set; }
+        [DataMember(Name = "triggers")] public List<CatalogTrigger> Triggers { get; set; }
+        [DataMember(Name = "parts")] public List<CatalogPart> Parts { get; set; }
+        [DataMember(Name = "after")] public CatalogAfter After { get; set; }
+        [DataMember(Name = "audios")] public Dictionary<string, CatalogAudio> Audios { get; set; }
+        public CatalogTrigger Trigger(string key) { return Triggers == null ? null : Triggers.Find(x => x != null && x.Key == key); }
+        public CatalogTilt Tilt(int n) { return Tilts == null ? null : Tilts.Find(x => x != null && x.N == n); }
+        public CatalogAudio Audio(string id)
+        { CatalogAudio audio; return id != null && Audios != null && Audios.TryGetValue(id, out audio) ? audio : null; }
+        public int RedLine { get { return Rules == null || Rules.RedLine <= 0 ? 7 : Rules.RedLine; } }
+    }
+    [DataContract] public sealed class CatalogRules
+    {
+        [DataMember(Name = "trade_max")] public int TradeMax { get; set; }
+        [DataMember(Name = "red_line")] public int RedLine { get; set; }
+    }
+    [DataContract] public sealed class CatalogTilt
+    {
+        [DataMember(Name = "n")] public int N { get; set; }
+        [DataMember(Name = "name")] public string Name { get; set; }
+        [DataMember(Name = "feel")] public string Feel { get; set; }
+        [DataMember(Name = "action")] public string Action { get; set; }
+        [DataMember(Name = "band")] public string Band { get; set; }
+    }
+    [DataContract] public sealed class CatalogTrigger
+    {
+        [DataMember(Name = "key")] public string Key { get; set; }
+        [DataMember(Name = "label")] public string Label { get; set; }
+        [DataMember(Name = "question")] public string Question { get; set; }
+        [DataMember(Name = "thoughts")] public List<CatalogThought> Thoughts { get; set; }
+        [DataMember(Name = "other")] public CatalogThought Other { get; set; }
+    }
+    [DataContract] public sealed class CatalogThought
+    {
+        [DataMember(Name = "key")] public string Key { get; set; }
+        [DataMember(Name = "text")] public string Text { get; set; }
+        [DataMember(Name = "lines")] public List<CatalogLine> Lines { get; set; }
+    }
+    [DataContract] public sealed class CatalogLine
+    {
+        [DataMember(Name = "id")] public string Id { get; set; }
+        [DataMember(Name = "text")] public string Text { get; set; }
+        [DataMember(Name = "audio")] public string Audio { get; set; }
+    }
+    [DataContract] public sealed class CatalogPart
+    {
+        [DataMember(Name = "name")] public string Name { get; set; }
+        [DataMember(Name = "sec")] public double Sec { get; set; }
+        [DataMember(Name = "todo")] public string Todo { get; set; }
+        [DataMember(Name = "say")] public string Say { get; set; }
+        [DataMember(Name = "kind")] public string Kind { get; set; }
+    }
+    [DataContract] public sealed class CatalogAfter
+    {
+        [DataMember(Name = "green")] public string Green { get; set; }
+        [DataMember(Name = "orange")] public string Orange { get; set; }
+        [DataMember(Name = "orange_twice")] public string OrangeTwice { get; set; }
+        [DataMember(Name = "red")] public string Red { get; set; }
+    }
+    [DataContract] public sealed class CatalogAudio
+    {
+        [DataMember(Name = "seconds")] public double Seconds { get; set; }
+        [DataMember(Name = "marks")] public CatalogMarks Marks { get; set; }
+    }
+    [DataContract] public sealed class CatalogMarks
+    {
+        [DataMember(Name = "steps")] public List<double> Steps { get; set; }
+        [DataMember(Name = "breaths")] public List<double> Breaths { get; set; }
+        [DataMember(Name = "end")] public double End { get; set; }
+    }
+
+    // ---- Today's trades (GET /api/nt/today, plan 31 section 2.3). ----
+    [DataContract] public sealed class TodayAnswer
+    {
+        [DataMember(Name = "date")] public string Date { get; set; }
+        [DataMember(Name = "server_time")] public long ServerTime { get; set; }
+        [DataMember(Name = "trades")] public List<TodayTrade> Trades { get; set; }
+    }
+    [DataContract] public sealed class TodayTrade
+    {
+        [DataMember(Name = "id")] public long Id { get; set; }
+        [DataMember(Name = "account")] public string Account { get; set; }
+        [DataMember(Name = "instrument")] public string Instrument { get; set; }
+        [DataMember(Name = "side")] public string Side { get; set; }
+        [DataMember(Name = "qty")] public int Qty { get; set; }
+        [DataMember(Name = "exit_time")] public long ExitTime { get; set; }
+        [DataMember(Name = "pnl_cents")] public long PnlCents { get; set; }
+        [DataMember(Name = "currency")] public string Currency { get; set; }
+        // null = no reset for this trade yet.
+        [DataMember(Name = "entry_id")] public long? EntryId { get; set; }
+    }
+
+    // ---- A finished reset (POST /api/nt/resets, plan 31 section 2.5). Exactly these keys. ----
+    [DataContract] public sealed class ResetBody
+    {
+        [DataMember(Name = "request_id")] public string RequestId { get; set; }
+        [DataMember(Name = "trade_id")] public long TradeId { get; set; }
+        [DataMember(Name = "thought")] public string Thought { get; set; }
+        [DataMember(Name = "logic_id")] public string LogicId { get; set; }
+        // null when the audio was skipped before part 2 (the site's "Logged without audio").
+        [DataMember(Name = "audio_id")] public string AudioId { get; set; }
+        [DataMember(Name = "tilt_before")] public int TiltBefore { get; set; }
+        [DataMember(Name = "tilt_before_local")] public string TiltBeforeLocal { get; set; }
+        [DataMember(Name = "tilt_after")] public int TiltAfter { get; set; }
+        [DataMember(Name = "tilt_after_local")] public string TiltAfterLocal { get; set; }
+        [DataMember(Name = "local")] public string Local { get; set; }
+        [DataMember(Name = "tapped_at")] public long TappedAt { get; set; }
+    }
+    [DataContract] public sealed class ResetAnswer
+    {
+        [DataMember(Name = "entry")] public ResetEntry Entry { get; set; }
+    }
+    [DataContract] public sealed class ResetEntry
+    {
+        [DataMember(Name = "id")] public long Id { get; set; }
+        [DataMember(Name = "trade_id")] public long TradeId { get; set; }
     }
 }

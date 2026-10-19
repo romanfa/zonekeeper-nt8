@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -21,6 +22,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public bool HasToken { get; set; }
         public string BaseUrl { get; set; }
         public bool AutoReset { get; set; }
+        // Trade ids with a finished reset waiting in resets.jsonl (the row shows "Saving…").
+        public List<long> SavingTradeIds { get; set; }
     }
     public sealed class SessionCoordinator
     {
@@ -28,6 +31,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private readonly object stateGate = new object();
         private readonly Settings settings;
         private readonly OutboxQueue outbox;
+        private readonly ResetOutbox resets;
         private readonly IAddonApi api;
         private readonly EventLog log;
         private ZkStatus status;
@@ -40,6 +44,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private string message = "";
         private string accountSaveMessage = "";
         private bool accountSavePending;
+        // A refused reset named logic_id or thought: the catalog texts changed on the site.
+        private volatile bool catalogStale;
         // Trade ids this run already raised the window for (the last 200).
         private readonly Queue<long> openedOrder = new Queue<long>();
         private readonly HashSet<long> opened = new HashSet<long>();
@@ -49,11 +55,14 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public event Action<long> ResetWanted;
         // The device key was deleted (Disconnect or 401): a running reset must stop.
         public event Action KeyRemoved;
+        // A waiting reset left the queue: (trade id, logged on the site). logged = false means the server refused it.
+        public event Action<long, bool> ResetSaved;
         // Engine start time. Trades closed before it never raise the window (no pop-up after a restart).
         public long RunStartedMs { get; set; }
-        public SessionCoordinator(Settings localSettings, OutboxQueue queue, IAddonApi client, EventLog eventLog)
+        public SessionCoordinator(Settings localSettings, OutboxQueue queue, IAddonApi client, EventLog eventLog) : this(localSettings, queue, null, client, eventLog) { }
+        public SessionCoordinator(Settings localSettings, OutboxQueue queue, ResetOutbox resetQueue, IAddonApi client, EventLog eventLog)
         {
-            settings = localSettings; outbox = queue; api = client; log = eventLog;
+            settings = localSettings; outbox = queue; resets = resetQueue; api = client; log = eventLog;
             log.ProtectSecret(settings.Token);
             status = settings.Token == null ? ZkStatus.NotConnected : ZkStatus.Checking;
             nextTryMs = settings.Token == null ? long.MaxValue : 0;
@@ -66,7 +75,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 NextTryMs = nextTryMs, LastSentMs = lastSentMs, ClockOffsetMs = clockOffsetMs };
             // Never acquire an external lock while holding stateGate.
             snapshot.EmailMasked = settings.EmailMasked; snapshot.Waiting = outbox.Count;
-            snapshot.HasToken = settings.Token != null; snapshot.BaseUrl = settings.BaseUrl; snapshot.AutoReset = settings.AutoReset; return snapshot;
+            snapshot.HasToken = settings.Token != null; snapshot.BaseUrl = settings.BaseUrl; snapshot.AutoReset = settings.AutoReset;
+            snapshot.SavingTradeIds = resets == null ? new List<long>() : resets.PendingTradeIds; return snapshot;
         }
         private void Publish()
         {
@@ -89,6 +99,13 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             var handler = ResetWanted;
             if (handler != null) foreach (Action<long> subscriber in handler.GetInvocationList()) try { subscriber(tradeId); } catch (Exception ex) { log.Error("Could not open the reset window", ex); }
         }
+        private void RaiseResetSaved(long tradeId, bool logged)
+        {
+            var handler = ResetSaved;
+            if (handler != null) foreach (Action<long, bool> subscriber in handler.GetInvocationList()) try { subscriber(tradeId, logged); } catch (Exception ex) { log.Error("Could not update the Today list", ex); }
+        }
+        // True once after a refused reset said the texts changed; the engine then loads the catalog again.
+        public bool TakeCatalogStale() { bool stale = catalogStale; catalogStale = false; return stale; }
         private void RememberOpened(long tradeId)
         {
             opened.Add(tradeId); openedOrder.Enqueue(tradeId);
@@ -196,6 +213,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             await serial.WaitAsync(cancellation).ConfigureAwait(false);
             IDisposable sendGuard = null;
             long resetId = 0;
+            SavedReset saved = null;
             try
             {
                 sendGuard = await outbox.EnterSendAsync(cancellation).ConfigureAwait(false);
@@ -257,7 +275,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     }
                     else Apply(result, nowMs);
                 }
-                else
+                else if (state != ZkStatus.Connected || resets == null || resets.Peek() == null)
                 {
                     var result = await api.PingAsync(settings.Token, cancellation).ConfigureAwait(false);
                     cancellation.ThrowIfCancellationRequested();
@@ -272,6 +290,10 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                         if (warning.Length != 0) log.Write(warning);
                     }
                 }
+                // Resets go after the trades: one per loop, only while Connected and no trade is waiting.
+                ZkStatus after; lock (stateGate) after = status;
+                if (after == ZkStatus.Connected && resets != null && resets.Peek() != null && outbox.Peek(1).Count == 0 && !cancellation.IsCancellationRequested)
+                    saved = await SendOneResetAsync(resets.Peek(), nowMs, cancellation).ConfigureAwait(false);
                 Publish();
             }
             catch (OperationCanceledException) { }
@@ -279,6 +301,53 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             finally { if (sendGuard != null) sendGuard.Dispose(); serial.Release(); }
             // Raised after the send is fully done and outside every lock.
             if (resetId > 0) RaiseResetWanted(resetId);
+            if (saved != null) RaiseResetSaved(saved.Line.TradeId, saved.Logged);
+        }
+        private sealed class SavedReset { public ResetLine Line; public bool Logged; }
+        // Answers (plan 31 section 2.5): 200 and 409 → gone, row Logged; 400 → gone, row back to Reset, one log line;
+        // 401 / 403 / 429 / no answer → the normal policy, the line waits.
+        private async Task<SavedReset> SendOneResetAsync(ResetLine line, long nowMs, CancellationToken cancellation)
+        {
+            var result = await api.SaveResetAsync(settings.Token, line.Body, cancellation).ConfigureAwait(false);
+            cancellation.ThrowIfCancellationRequested();
+            SavedReset done = null;
+            if (result.Kind == ApiKind.Ok || result.Kind == ApiKind.AlreadyDone || result.Kind == ApiKind.BadRequest)
+            {
+                if (!resets.Remove(line.RequestId)) { Apply(new ApiResult { Kind = ApiKind.Offline }, nowMs); return null; }
+                if (result.Kind == ApiKind.Ok) log.Write(UiText.ResetSaved(line.ExitTime));
+                else if (result.Kind == ApiKind.AlreadyDone) log.Write(UiText.ResetDoneElsewhere);
+                else
+                {
+                    log.Write(UiText.ResetRefused(result.Error));
+                    string error = result.Error ?? "";
+                    if (error.IndexOf("logic_id", StringComparison.OrdinalIgnoreCase) >= 0 || error.IndexOf("thought", StringComparison.OrdinalIgnoreCase) >= 0) catalogStale = true;
+                }
+                Apply(new ApiResult { Kind = ApiKind.Ok }, nowMs);
+                int remaining = resets.Count + outbox.Count;
+                lock (stateGate) { if (result.Kind != ApiKind.BadRequest) lastSentMs = nowMs; nextTryMs = remaining != 0 ? nowMs : nowMs + 300000; }
+                done = new SavedReset { Line = line, Logged = result.Kind != ApiKind.BadRequest };
+            }
+            else Apply(result, nowMs);
+            return done;
+        }
+        // Today's trades, the catalog and the audio run outside the serial lock (a 60-second audio download must never
+        // delay a trade send). Only 401 and 403 not_paid change the connection, and only while the same key is still set.
+        public Task<ApiResult> TodayAsync(string date, long nowMs, CancellationToken cancellation)
+        { return GuardedAsync(token => api.TodayAsync(token, date, cancellation), nowMs, cancellation); }
+        public Task<ApiResult> CatalogAsync(string etag, long nowMs, CancellationToken cancellation)
+        { return GuardedAsync(token => api.CatalogAsync(token, etag, cancellation), nowMs, cancellation); }
+        public Task<ApiResult> AudioAsync(string id, Stream target, IProgress<int> percent, long nowMs, CancellationToken cancellation)
+        { return GuardedAsync(token => api.DownloadAudioAsync(token, id, target, percent, cancellation), nowMs, cancellation); }
+        private async Task<ApiResult> GuardedAsync(Func<string, Task<ApiResult>> call, long nowMs, CancellationToken cancellation)
+        {
+            string token = settings.Token;
+            if (token == null || disconnectPending) return new ApiResult { Kind = ApiKind.NotConnected };
+            var result = await call(token).ConfigureAwait(false);
+            if (result.Kind != ApiKind.NotConnected && result.Kind != ApiKind.NotPaid) return result;
+            await serial.WaitAsync(cancellation).ConfigureAwait(false);
+            try { if (settings.Token == token) { Apply(result, nowMs); Publish(); Wake(); } }
+            finally { serial.Release(); }
+            return result;
         }
         private static bool ValidTradesAnswer(TradesAnswer answer, int count)
         {

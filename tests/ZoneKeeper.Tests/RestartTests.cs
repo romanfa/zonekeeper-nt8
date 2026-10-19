@@ -22,6 +22,14 @@ namespace ZoneKeeper.Tests
             { Sent.AddRange(trades); return Inner.SendTradesAsync(token, trades, cancellation); }
             public Task<ApiResult> DisconnectAsync(string token, CancellationToken cancellation)
             { return Inner.DisconnectAsync(token, cancellation); }
+            public Task<ApiResult> CatalogAsync(string token, string etag, CancellationToken cancellation)
+            { return Inner.CatalogAsync(token, etag, cancellation); }
+            public Task<ApiResult> TodayAsync(string token, string date, CancellationToken cancellation)
+            { return Inner.TodayAsync(token, date, cancellation); }
+            public Task<ApiResult> SaveResetAsync(string token, ResetBody body, CancellationToken cancellation)
+            { return Inner.SaveResetAsync(token, body, cancellation); }
+            public Task<ApiResult> DownloadAudioAsync(string token, string id, System.IO.Stream target, IProgress<int> percent, CancellationToken cancellation)
+            { return Inner.DownloadAudioAsync(token, id, target, percent, cancellation); }
             public void Dispose() { Inner.Dispose(); }
         }
         private sealed class Harness

@@ -32,5 +32,10 @@
     <Compile Include="../../src/ZoneKeeper/AccountIdentityMap.cs" Link="Src/AccountIdentityMap.cs" />
     <Compile Include="../../src/ZoneKeeper/ResyncBoundary.cs" Link="Src/ResyncBoundary.cs" />
     <Compile Include="../../src/ZoneKeeper/ResetRules.cs" Link="Src/ResetRules.cs" />
+    <Compile Include="../../src/ZoneKeeper/CatalogStore.cs" Link="Src/CatalogStore.cs" />
+    <Compile Include="../../src/ZoneKeeper/AudioRules.cs" Link="Src/AudioRules.cs" />
+    <Compile Include="../../src/ZoneKeeper/ResetOutbox.cs" Link="Src/ResetOutbox.cs" />
+    <Compile Include="../../src/ZoneKeeper/TodayRules.cs" Link="Src/TodayRules.cs" />
+    <Compile Include="../../src/ZoneKeeper/ResetSession.cs" Link="Src/ResetSession.cs" />
   </ItemGroup>
 </Project>
