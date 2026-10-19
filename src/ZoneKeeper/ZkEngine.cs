@@ -20,17 +20,30 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public List<AccountChoice> Accounts { get; set; }
         public List<string> Events { get; set; }
     }
-    // The static event remains valid for a window across an engine stop/start on F5.
+    // What the window gets back when it asks for the voice of a line: a temp file to play, or why not.
+    public sealed class AudioResult
+    {
+        public ApiKind Kind { get; set; }
+        public string Path { get; set; }
+    }
+    // The static events remain valid for a window across an engine stop/start on F5.
     public static class ZkEngine
     {
         private static readonly object gate = new object();
         private static Run current;
         private static object pendingOwner;
         public static event Action Changed;
+        // A waiting reset left the queue: (trade id, logged on the site). The Today list updates its row.
+        public static event Action<long, bool> ResetSaved;
         private static void Publish()
         {
             var handler = Changed;
             if (handler != null) foreach (Action subscriber in handler.GetInvocationList()) try { subscriber(); } catch (Exception) { }
+        }
+        private static void PublishResetSaved(long tradeId, bool logged)
+        {
+            var handler = ResetSaved;
+            if (handler != null) foreach (Action<long, bool> subscriber in handler.GetInvocationList()) try { subscriber(tradeId, logged); } catch (Exception) { }
         }
         public static bool Start(object owner)
         {
@@ -103,6 +116,48 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             var run = ActiveRun();
             if (run != null) Task.Run(() => run.SaveWindowBounds(bounds));
         }
+        public static WindowBounds SavedWindowBounds()
+        {
+            try { var run = ActiveRun(); return run == null || run.settings == null ? null : run.settings.WindowBounds; }
+            catch (Exception) { return null; }
+        }
+        // The reset texts: the copy on disk, loaded again from the site when it is older than 6 hours. Null = none yet.
+        public static Task<Catalog> CatalogAsync()
+        {
+            var run = ActiveRun();
+            return run == null ? Task.FromResult<Catalog>(null) : Task.Run(() => run.CatalogAsync());
+        }
+        // Today's trades from the site. Null = no answer (the window keeps its old list).
+        public static Task<TodayAnswer> TodayAsync()
+        {
+            var run = ActiveRun();
+            return run == null ? Task.FromResult<TodayAnswer>(null) : Task.Run(() => run.TodayAsync());
+        }
+        // The voice of one line: downloaded into memory now, size-checked, written to one temp file. Nothing is cached.
+        public static Task<AudioResult> AudioTempFileAsync(string id, IProgress<int> percent, CancellationToken cancellation)
+        {
+            var run = ActiveRun();
+            return run == null ? Task.FromResult(new AudioResult { Kind = ApiKind.Offline }) : Task.Run(() => run.AudioTempFileAsync(id, percent, cancellation));
+        }
+        // Deletes every .mp3 left in %TEMP%\ZoneKeeper (a crash can leave one). At engine start and when the window opens.
+        public static void WipeAudioTemp()
+        {
+            Task.Run(() => {
+                try
+                {
+                    string folder = AudioRules.TempFolder(Path.GetTempPath());
+                    if (!Directory.Exists(folder)) return;
+                    foreach (string file in AudioRules.Leftovers(Directory.GetFiles(folder))) try { File.Delete(file); } catch (Exception) { }
+                }
+                catch (Exception ex) { ReportError("Could not clean the audio temp folder", ex); }
+            });
+        }
+        // The step-5 tap: the finished reset goes into resets.jsonl (written before this returns true) and the sender is woken.
+        public static Task<bool> QueueResetAsync(ResetBody body, long exitMs)
+        {
+            var run = ActiveRun();
+            return run == null ? Task.FromResult(false) : Task.Run(() => run.QueueReset(body, exitMs));
+        }
 
         private sealed class Run
         {
@@ -117,7 +172,11 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             private Task fillTask;
             private Task senderTask;
             private ApiClient api;
-            private Settings settings;
+            internal Settings settings;
+            private CatalogStore catalogs;
+            private ResetOutbox resets;
+            private readonly SemaphoreSlim catalogGate = new SemaphoreSlim(1, 1);
+            private long catalogTriedMs;
             internal FillCoordinator fills;
             internal AccountWatcher watcher;
             internal SessionCoordinator session;
@@ -139,6 +198,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             public void BeginStop()
             {
                 stopping = true;
+                ZoneKeeperWindow.StopAudio();
                 cancel.Cancel();
                 if (watcher != null) watcher.Stop();
                 work.CompleteAdding();
@@ -228,6 +288,83 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 try { if (!stopping && settings != null) settings.SetWindowBounds(bounds); }
                 catch (Exception ex) { log.Error(UiText.SaveFailed, ex); }
             }
+            public async Task<Catalog> CatalogAsync()
+            {
+                if (stopping || session == null || catalogs == null) return null;
+                try
+                {
+                    if (session.TakeCatalogStale()) catalogs.MarkStale();
+                    long now = Helpers.NowMs();
+                    if (catalogs.NeedsRefresh(now) && settings.Token != null)
+                    {
+                        await catalogGate.WaitAsync(cancel.Token).ConfigureAwait(false);
+                        try
+                        {
+                            // With an old copy in hand, a failed refresh is tried again after a minute, not on every call.
+                            if (catalogs.NeedsRefresh(now) && (catalogs.Current == null || now - catalogTriedMs >= 60000))
+                            {
+                                catalogTriedMs = now;
+                                var result = await session.CatalogAsync(catalogs.ETag, now, cancel.Token).ConfigureAwait(false);
+                                var catalog = result.Body as Catalog;
+                                if (result.Kind == ApiKind.Ok && result.Status == 304) catalogs.Touch(now);
+                                else if (result.Kind == ApiKind.Ok && catalog != null) { if (catalogs.Save(catalog, result.ETag, now)) log.Write("Reset texts loaded from the site."); }
+                                // Any other answer: the old copy stays (works offline).
+                            }
+                        }
+                        finally { catalogGate.Release(); }
+                    }
+                }
+                catch (OperationCanceledException) { }
+                catch (Exception ex) { log.Error("Could not load the reset texts", ex); }
+                return catalogs.Current;
+            }
+            public async Task<TodayAnswer> TodayAsync()
+            {
+                if (stopping || session == null) return null;
+                try
+                {
+                    var result = await session.TodayAsync(Helpers.LocalDateNow(TimeZoneInfo.Local), Helpers.NowMs(), cancel.Token).ConfigureAwait(false);
+                    return result.Kind == ApiKind.Ok ? result.Body as TodayAnswer : null;
+                }
+                catch (OperationCanceledException) { return null; }
+                catch (Exception ex) { log.Error("Could not load today's trades", ex); return null; }
+            }
+            public async Task<AudioResult> AudioTempFileAsync(string id, IProgress<int> percent, CancellationToken cancellation)
+            {
+                if (stopping || session == null) return new AudioResult { Kind = ApiKind.Offline };
+                try
+                {
+                    using (var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellation, cancel.Token))
+                    using (var memory = new MemoryStream())
+                    {
+                        var result = await session.AudioAsync(id, memory, percent, Helpers.NowMs(), linked.Token).ConfigureAwait(false);
+                        if (result.Kind == ApiKind.NotPaid || result.Kind == ApiKind.NotConnected) return new AudioResult { Kind = result.Kind };
+                        if (result.Kind != ApiKind.Ok || !AudioRules.SizeOk(memory.Length, result.ContentLength))
+                        {
+                            if (!cancellation.IsCancellationRequested) log.Write("No voice for this reset (" + Helpers.Cut(id, 16) + ", " + result.Kind + "). " + UiText.AudioNeedsConnection);
+                            return new AudioResult { Kind = ApiKind.Offline };
+                        }
+                        string folder = AudioRules.TempFolder(Path.GetTempPath());
+                        Directory.CreateDirectory(folder);
+                        string path = Path.Combine(folder, AudioRules.TempName());
+                        using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                        { memory.Position = 0; memory.CopyTo(file); file.Flush(true); }
+                        return new AudioResult { Kind = ApiKind.Ok, Path = path };
+                    }
+                }
+                catch (OperationCanceledException) { return new AudioResult { Kind = ApiKind.Offline }; }
+                catch (Exception ex) { log.Error("Could not get the voice for this reset", ex); return new AudioResult { Kind = ApiKind.Offline }; }
+            }
+            public bool QueueReset(ResetBody body, long exitMs)
+            {
+                try
+                {
+                    if (stopping || resets == null || session == null) return false;
+                    if (!resets.Add(body, exitMs, Helpers.NowMs())) return false;
+                    session.NotifyQueued(); return true;
+                }
+                catch (Exception ex) { log.Error(UiText.SaveFailed, ex); return false; }
+            }
             public void SetAccounts(List<AccountChoice> choices)
             { lock (accountsGate) accounts = choices; Publish(); }
             public EngineSnapshot Snapshot()
@@ -298,9 +435,16 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                             settings = new Settings(Path.Combine(folder, "settings.json"), files, new WindowsTokenProtector(), log.Write);
                             var outbox = new OutboxQueue(Path.Combine(folder, "outbox.jsonl"), files, log.Write);
                             fills = new FillCoordinator(new TradeBuilder(TimeZoneInfo.Local, log.Write), new OpenTradesFile(Path.Combine(folder, "open-trades.json"), files, log.Write), outbox);
+                            catalogs = new CatalogStore(Path.Combine(folder, "catalog.json"), files, log.Write);
+                            resets = new ResetOutbox(Path.Combine(folder, "resets.jsonl"), files, log.Write);
                             api = new ApiClient(settings.BaseUrl, log.ProtectSecret);
-                            session = new SessionCoordinator(settings, outbox, api, log) { RunStartedMs = Helpers.NowMs() };
+                            session = new SessionCoordinator(settings, outbox, resets, api, log) { RunStartedMs = Helpers.NowMs() };
                             session.Changed += Publish; session.WorkAvailable += Wake;
+                            // A fresh closed trade: the window comes up with its reset (never on NinjaTrader's threads: the window dispatches itself).
+                            session.ResetWanted += id => { if (!stopping) ZoneKeeperWindow.RaiseForTrade(id); };
+                            session.ResetSaved += PublishResetSaved;
+                            // Key gone (Disconnect or 401): a running voice stops at once.
+                            session.KeyRemoved += ZoneKeeperWindow.StopAudio;
                             outbox.DurableAdded += trade => { log.TradeClosed(trade); session.NotifyQueued(); };
                             outbox.ReadyToSend += session.NotifyQueued;
                             break;
@@ -318,6 +462,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     // Covers Stop racing startup between the cancellation check and watcher.Start.
                     if (stopping) watcher.Stop();
                     senderTask = Task.Run((Func<Task>)SenderLoopAsync);
+                    WipeAudioTemp();
                     log.Write("ZoneKeeper engine started (Active)."); Publish();
                     await Task.WhenAll(fillTask, senderTask).ConfigureAwait(false);
                 }
@@ -371,6 +516,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     {
                         await session.ProcessAsync(Helpers.NowMs(), cancel.Token).ConfigureAwait(false);
                         var snapshot = session.Snapshot();
+                        // The catalog refresh (at start when Connected, then every 6 hours, or after a refused save) rides on the sender loop.
+                        if (snapshot.Status == ZkStatus.Connected) await CatalogAsync().ConfigureAwait(false);
                         long remaining = snapshot.NextTryMs == long.MaxValue ? int.MaxValue : Math.Max(0, snapshot.NextTryMs - Helpers.NowMs());
                         await wake.WaitAsync((int)Math.Min(int.MaxValue, remaining), cancel.Token).ConfigureAwait(false);
                     }
