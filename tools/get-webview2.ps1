@@ -18,6 +18,8 @@ $sdk = Join-Path $Dist 'webview2-sdk'
 $package = Join-Path $Dist "microsoft.web.webview2.$version.nupkg"
 New-Item -ItemType Directory -Path $Dist -Force | Out-Null
 if (-not (Test-Path -LiteralPath $package -PathType Leaf)) {
+    # Windows PowerShell 5.1 may offer only TLS 1.0/1.1; nuget.org needs TLS 1.2.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     Invoke-WebRequest -UseBasicParsing -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/$version/microsoft.web.webview2.$version.nupkg" -OutFile $package
 }
 if ((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash.ToLowerInvariant() -ne $packageHash) { throw "Package hash differs. Delete $package and try again." }
