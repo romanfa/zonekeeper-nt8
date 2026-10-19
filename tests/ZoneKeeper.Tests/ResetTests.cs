@@ -481,6 +481,19 @@ namespace ZoneKeeper.Tests
             Assert.Null(ResetRules.LoaderFolder(null, path => true));
         }
         [Fact]
+        public void OnlyADeadMainBrowserProcessClosesTheWindow()
+        {
+            Assert.True(ResetRules.ClosesWindow("BrowserProcessExited"));
+            foreach (string kind in new[] { "RenderProcessExited", "RenderProcessUnresponsive", "FrameRenderProcessExited", "GpuProcessExited", "UtilityProcessExited", "SandboxHelperProcessExited", "UnknownProcessExited", "", null })
+                Assert.False(ResetRules.ClosesWindow(kind));
+        }
+        [Fact]
+        public void BrowserProfileLivesInLocalAppDataNotDocuments()
+        {
+            string local = System.IO.Path.Combine("C:", "Users", "Admin", "AppData", "Local");
+            Assert.Equal(System.IO.Path.Combine(local, "ZoneKeeper", "webview2"), ResetRules.ProfileFolder(local));
+        }
+        [Fact]
         public void RetryWaitsGrowAndRespectRetryAfter()
         {
             Assert.Equal(new long[] { 5000, 15000, 30000, 60000, 60000, 60000 }, Enumerable.Range(0, 6).Select(i => ResetRules.RetryDelayMs(i, null)).ToArray());

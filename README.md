@@ -41,7 +41,8 @@ Local files live in `Documents\NinjaTrader 8\ZoneKeeper\` (the NinjaTrader user 
 | `open-trades.json` | Pending closed trades, fill provenance and safety metadata for the outbox handoff. `open_trades` is always empty; saved open trades are ignored on load. |
 | `zonekeeper.log`, `zonekeeper.1.log` | Event log and rotated log. Codes and device keys are not logged. |
 | `running.lock` | Keeps one engine active for this Windows user. |
-| `webview2\` | Browser profile of the reset window (site login cookie for this PC). |
+
+The reset window's browser profile (the site login cookie for this PC) is not in that folder: it lives in `%LOCALAPPDATA%\ZoneKeeper\webview2`, because OneDrive often syncs Documents and a synced browser profile breaks.
 
 Offline trades wait locally and retry. If the subscription loses access, the key and waiting trades stay and the add-on checks again hourly. A disconnected PC needs a new code. Waiting trades belong to whichever ZoneKeeper account the PC connects to next. A key copied to another PC or Windows user cannot be decrypted; connect that PC separately.
 

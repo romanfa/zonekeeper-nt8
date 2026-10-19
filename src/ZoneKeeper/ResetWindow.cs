@@ -188,8 +188,10 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
 
         internal void BrowserStopped(string kind)
         {
+            if (!ResetRules.ClosesWindow(kind)) { ZkEngine.Note(UiText.ResetBrowserHiccup(kind)); return; }
             ZkEngine.Note(UiText.ResetBrowserStopped(kind));
-            Close();
+            // Never close or dispose inside the WebView2 event itself: do it a moment later on the dispatcher.
+            RunOnWindow(Close);
         }
 
         // Only https links after a click (ResetRules). Never logged: a link can hold private data.

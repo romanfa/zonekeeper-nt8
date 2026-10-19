@@ -258,7 +258,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 {
                     if (stopping || settings == null) return;
                     var open = new ResetOpen { BaseUrl = settings.BaseUrl, Bounds = settings.ResetWindow,
-                        UserDataFolder = Path.Combine(folder, "webview2"),
+                        UserDataFolder = ResetRules.ProfileFolder(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)),
                         LoaderFolder = ResetRules.LoaderFolder(Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "bin", "Custom"), File.Exists) };
                     ShowReset(tradeId, open, activate);
                 }

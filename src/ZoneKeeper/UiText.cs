@@ -34,6 +34,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         { return "Opened the reset for the trade closed at " + DateTimeOffset.FromUnixTimeMilliseconds(exitMs).ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture) + "."; }
         public static string ResetStartFailed(string typeName)
         { return "Reset window could not start (" + Helpers.Cut(typeName, 80) + "). Trades are still sent."; }
+        public static string ResetBrowserHiccup(string kind)
+        { return "Reset window: a browser part stopped or hung (" + Helpers.Cut(kind, 80) + "). The window stays open."; }
         public static string ResetBrowserStopped(string kind)
         { return "Reset window: the browser stopped (" + Helpers.Cut(kind, 80) + "). The window closed. Trades are still sent."; }
         public static string ResetStatus(ResetView view, long retryMs)

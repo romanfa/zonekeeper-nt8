@@ -150,6 +150,14 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             return fileExists(Path.Combine(customFolder, "WebView2Loader.dll")) ? customFolder : null;
         }
 
+        // Only a dead main browser process ends the window. WebView2 restarts render, GPU and helper
+        // processes by itself, and "unresponsive" passes when a busy PC catches up.
+        public static bool ClosesWindow(string processFailedKind) { return processFailedKind == "BrowserProcessExited"; }
+
+        // The browser profile lives in %LOCALAPPDATA%, not in Documents: OneDrive often syncs Documents,
+        // and a synced WebView2 profile breaks (file locks, big cache, login cookie in the cloud).
+        public static string ProfileFolder(string localAppData) { return Path.Combine(localAppData ?? "", "ZoneKeeper", "webview2"); }
+
         private static bool Finite(double value) { return !double.IsNaN(value) && !double.IsInfinity(value); }
         private static bool TrySite(string baseUrl, out Uri site)
         {
