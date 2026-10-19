@@ -50,6 +50,8 @@ namespace ZoneKeeper.Tests
         public int Pings;
         public int Sends;
         public int Disconnects;
+        public int Handoffs;
+        public readonly Queue<ApiResult> HandoffAnswers = new Queue<ApiResult>();
         public readonly List<int> BatchSizes = new List<int>();
         public readonly List<string> Tokens = new List<string>();
         public readonly Queue<ApiResult> SendAnswers = new Queue<ApiResult>();
@@ -69,6 +71,8 @@ namespace ZoneKeeper.Tests
         }
         public Task<ApiResult> DisconnectAsync(string token, CancellationToken cancellation)
         { Disconnects++; Tokens.Add(token); return Task.FromResult(DisconnectResult); }
+        public Task<ApiResult> HandoffAsync(string token, CancellationToken cancellation)
+        { Handoffs++; Tokens.Add(token); return Task.FromResult(HandoffAnswers.Count == 0 ? Fixtures.Handoff() : HandoffAnswers.Dequeue()); }
         public void Dispose() { }
     }
     public sealed class FakeHttp : HttpMessageHandler
@@ -114,6 +118,9 @@ namespace ZoneKeeper.Tests
         { return new ApiResult { Kind = ApiKind.Ok, Status = 200, Body = new PingAnswer { Ok = true, DeviceId = 7, PlanStatus = "active", ServerTime = time } }; }
         public static ApiResult Sent(int count)
         { return new ApiResult { Kind = ApiKind.Ok, Status = 200, Body = new TradesAnswer { Inserted = count, Duplicates = 0, Rejected = new List<RejectedTrade>() } }; }
+        public static string HandoffKey { get { return new string('h', 43); } }
+        public static ApiResult Handoff()
+        { return new ApiResult { Kind = ApiKind.Ok, Status = 200, Body = new HandoffAnswer { Handoff = HandoffKey, ExpiresIn = 60 } }; }
         public static Settings Settings(MemoryFiles files, bool connected = false)
         {
             var settings = new Settings("settings", files, new FakeProtector(), delegate { });

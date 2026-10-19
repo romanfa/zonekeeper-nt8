@@ -20,6 +20,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public int Waiting { get; set; }
         public bool HasToken { get; set; }
         public string BaseUrl { get; set; }
+        public bool AutoReset { get; set; }
     }
     public sealed class SessionCoordinator
     {
@@ -39,8 +40,18 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private string message = "";
         private string accountSaveMessage = "";
         private bool accountSavePending;
+        private bool unsupportedLogged;
+        // Trade ids this run already opened in the reset window (the last 200).
+        private readonly Queue<long> openedOrder = new Queue<long>();
+        private readonly HashSet<long> opened = new HashSet<long>();
         public event Action Changed;
         public event Action WorkAvailable;
+        // A fresh trade was saved: open the reset window for this trade id.
+        public event Action<long> ResetWanted;
+        // The device key was deleted (Disconnect or 401): the reset window must close.
+        public event Action KeyRemoved;
+        // Engine start time. Trades closed before it never open the reset window (no pop-up after a restart).
+        public long RunStartedMs { get; set; }
         public SessionCoordinator(Settings localSettings, OutboxQueue queue, IAddonApi client, EventLog eventLog)
         {
             settings = localSettings; outbox = queue; api = client; log = eventLog;
@@ -56,7 +67,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 NextTryMs = nextTryMs, LastSentMs = lastSentMs, ClockOffsetMs = clockOffsetMs };
             // Never acquire an external lock while holding stateGate.
             snapshot.EmailMasked = settings.EmailMasked; snapshot.Waiting = outbox.Count;
-            snapshot.HasToken = settings.Token != null; snapshot.BaseUrl = settings.BaseUrl; return snapshot;
+            snapshot.HasToken = settings.Token != null; snapshot.BaseUrl = settings.BaseUrl; snapshot.AutoReset = settings.AutoReset; return snapshot;
         }
         private void Publish()
         {
@@ -67,6 +78,22 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         {
             var handler = WorkAvailable;
             if (handler != null) foreach (Action subscriber in handler.GetInvocationList()) try { subscriber(); } catch (Exception) { }
+        }
+        private void RaiseKeyRemoved()
+        {
+            var handler = KeyRemoved;
+            if (handler != null) foreach (Action subscriber in handler.GetInvocationList()) try { subscriber(); } catch (Exception) { }
+        }
+        // A reset window error must never stop trade sending.
+        private void RaiseResetWanted(long tradeId)
+        {
+            var handler = ResetWanted;
+            if (handler != null) foreach (Action<long> subscriber in handler.GetInvocationList()) try { subscriber(tradeId); } catch (Exception ex) { log.Error("Could not open the reset window", ex); }
+        }
+        private void RememberOpened(long tradeId)
+        {
+            opened.Add(tradeId); openedOrder.Enqueue(tradeId);
+            while (openedOrder.Count > ResetRules.OpenedLimit) opened.Remove(openedOrder.Dequeue());
         }
         public void NotifyQueued()
         {
@@ -144,7 +171,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             var answer = result.Body as DisconnectAnswer;
             if ((result.Kind == ApiKind.Ok && answer != null && answer.Ok) || result.Kind == ApiKind.NotConnected || result.Status == 404)
             {
-                settings.DeleteToken(); disconnectPending = false;
+                settings.DeleteToken(); disconnectPending = false; RaiseKeyRemoved();
                 lock (stateGate)
                 {
                     status = ZkStatus.NotConnected; nextTryMs = long.MaxValue;
@@ -163,12 +190,13 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 decision = ConnectionPolicy.Apply(status, result, backoffStep, nowMs);
                 status = decision.Status; nextTryMs = decision.NextTryMs; backoffStep = decision.BackoffStep; message = decision.Message ?? "";
             }
-            if (decision.DeleteToken) { settings.DeleteToken(); if (settings.IsDirty) lock (stateGate) nextTryMs = nowMs + 15000; }
+            if (decision.DeleteToken) { settings.DeleteToken(); if (settings.IsDirty) lock (stateGate) nextTryMs = nowMs + 15000; RaiseKeyRemoved(); }
         }
         public async Task ProcessAsync(long nowMs, CancellationToken cancellation)
         {
             await serial.WaitAsync(cancellation).ConfigureAwait(false);
             IDisposable sendGuard = null;
+            long resetId = 0;
             try
             {
                 sendGuard = await outbox.EnterSendAsync(cancellation).ConfigureAwait(false);
@@ -221,6 +249,11 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                             int remaining = outbox.Count;
                             lock (stateGate) { lastSentMs = nowMs; nextTryMs = remaining != 0 ? nowMs : nowMs + 300000; }
                             if (outbox.Count == 0) singles = false;
+                            if (settings.AutoReset)
+                            {
+                                var pick = ResetRules.PickTrade(batch.Select(x => x.Trade).ToList(), answer, nowMs, RunStartedMs, opened);
+                                if (pick != null) { resetId = pick.Id; RememberOpened(pick.Id); log.Write(UiText.ResetOpened(batch[pick.Index].Trade.ExitTime)); }
+                            }
                         }
                     }
                     else Apply(result, nowMs);
@@ -245,6 +278,38 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             catch (OperationCanceledException) { }
             catch (Exception ex) { log.Error("Could not send waiting trades", ex); Apply(new ApiResult { Kind = ApiKind.Offline }, nowMs); Publish(); }
             finally { if (sendGuard != null) sendGuard.Dispose(); serial.Release(); }
+            // Raised after the send is fully done and outside every lock.
+            if (resetId > 0) RaiseResetWanted(resetId);
+        }
+        // Gets a one-use login key for the reset window. Only 401 and 403 not_paid change the connection
+        // (same policy as a send). No answer, 429 and 5xx never touch it, so trade sending goes on.
+        public async Task<HandoffResult> HandoffAsync(long nowMs, CancellationToken cancellation)
+        {
+            await serial.WaitAsync(cancellation).ConfigureAwait(false);
+            try
+            {
+                string token = settings.Token;
+                if (token == null || disconnectPending) return HandoffResult.Of(HandoffStatus.NotConnected);
+                var result = await api.HandoffAsync(token, cancellation).ConfigureAwait(false);
+                cancellation.ThrowIfCancellationRequested();
+                var answer = result.Body as HandoffAnswer;
+                if (result.Kind == ApiKind.Ok && answer != null && ResetRules.ValidHandoff(answer.Handoff))
+                    return new HandoffResult { Status = HandoffStatus.Ok, Handoff = answer.Handoff };
+                if (result.Kind == ApiKind.NotConnected || result.Kind == ApiKind.NotPaid)
+                {
+                    Apply(result, nowMs); Publish(); Wake();
+                    return HandoffResult.Of(result.Kind == ApiKind.NotPaid ? HandoffStatus.NotPaid : HandoffStatus.NotConnected);
+                }
+                if (result.Status == 404)
+                {
+                    if (!unsupportedLogged) { unsupportedLogged = true; log.Write(UiText.ResetUnsupported); }
+                    return HandoffResult.Of(HandoffStatus.Unsupported);
+                }
+                return new HandoffResult { Status = HandoffStatus.Offline, RetryAfter = result.RetryAfter };
+            }
+            catch (OperationCanceledException) { return HandoffResult.Of(HandoffStatus.Offline); }
+            catch (Exception ex) { log.Error("Could not get a reset login", ex); return HandoffResult.Of(HandoffStatus.Offline); }
+            finally { serial.Release(); }
         }
         private static bool ValidTradesAnswer(TradesAnswer answer, int count)
         {
