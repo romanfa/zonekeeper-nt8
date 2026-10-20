@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -61,8 +62,6 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private Catalog catalog;
         private readonly HashSet<long> knownIds = new HashSet<long>();
         private readonly HashSet<long> newIds = new HashSet<long>();
-        // Trade ids whose reset was just tapped: "Saving…" at once, before the engine snapshot shows them.
-        private readonly HashSet<long> queuedNow = new HashSet<long>();
         private bool firstLoad = true;
         private Task refreshTask;
         private long pollPausedUntil;
@@ -146,7 +145,9 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             Closed += delegate {
                 closed = true; poll.Stop(); noteTimer.Stop();
                 if (boundsTimer.IsEnabled) { boundsTimer.Stop(); Guard("Could not save the window place", SaveBounds); }
-                panel.StopAudio();
+                // The reset ends with the window: a download still running finds no session and deletes its file.
+                Guard("Could not close the reset", () => panel.Close(false));
+                ZkEngine.WipeAudioTemp();
                 ZkEngine.Changed -= OnChanged; ZkEngine.ResetSaved -= OnEngineResetSaved;
                 lock (oneGate) if (ReferenceEquals(one, this)) one = null;
             };
@@ -208,8 +209,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         {
             try
             {
-                ZoneKeeperWindow window;
-                lock (oneGate) window = one;
+                // No lock here: the engine calls this while it stops, and a window being built reads the engine.
+                var window = Volatile.Read(ref one);
                 if (window == null || window.closed) return;
                 window.Dispatcher.InvokeAsync(new Action(() => {
                     try { if (!window.closed) window.panel.Close(true); }
@@ -236,39 +237,33 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 if (trade == null) return;
                 // A running reset is never interrupted: the row shows "new" + Reset; the member taps it after the save.
                 if (panel.Running) return;
-                if (catalog == null) catalog = await ZkEngine.CatalogAsync();
-                if (closed || catalog == null) { RenderToday(); return; }
-                newIds.Remove(tradeId);
-                OpenReset(trade);
+                await OpenResetAsync(trade);
             }
             catch (Exception ex) { ZkEngine.ReportError("Could not open the reset", ex); }
         }
-        private void OpenReset(TodayTrade trade)
+        // Right before a reset opens the catalog is taken again (the store answers at once; HTTP only when due).
+        private async Task OpenResetAsync(TodayTrade trade)
         {
+            await ReloadCatalogAsync();
+            if (closed || catalog == null || panel.Running) { RenderToday(); return; }
+            newIds.Remove(trade.Id);
             ruleBox.Visibility = Visibility.Collapsed;
             panel.Open(catalog, trade);
             RenderToday();
         }
+        private async Task ReloadCatalogAsync()
+        {
+            var fresh = await ZkEngine.CatalogAsync();
+            if (fresh != null) catalog = fresh;
+        }
+        // The body is on disk (resets.jsonl): the rule text shows and the row says "Saving…" (from the engine snapshot).
         private void OnResetSaved(ResetSession session, ResetBody body)
         {
             string text = session.AfterText(body.TiltAfter, previousAfter);
             string band = ResetSession.AfterBand(session.Catalog, body.TiltAfter, previousAfter);
             previousAfter = body.TiltAfter;
             ruleText.Text = text; ruleBox.Background = ResetPanel.BandBrushFor(band); ruleBox.Visibility = Visibility.Visible;
-            queuedNow.Add(body.TradeId);
             RenderToday();
-            QueueReset(session, body);
-        }
-        private async void QueueReset(ResetSession session, ResetBody body)
-        {
-            try
-            {
-                bool ok = await ZkEngine.QueueResetAsync(body, session.Trade.ExitTime);
-                if (closed) return;
-                if (!ok) { queuedNow.Remove(body.TradeId); ShowNote(UiText.SaveFailed, false); }
-                RenderToday();
-            }
-            catch (Exception ex) { ZkEngine.ReportError("Could not queue the reset", ex); }
         }
         private void OnEngineResetSaved(long tradeId, bool logged)
         {
@@ -293,12 +288,13 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private async Task RefreshCoreAsync(bool force)
         {
             var s = ZkEngine.Snapshot().Session;
-            if (!s.HasToken) { today = null; knownIds.Clear(); newIds.Clear(); queuedNow.Clear(); firstLoad = true; RenderToday(); return; }
+            if (!s.HasToken) { today = null; knownIds.Clear(); newIds.Clear(); firstLoad = true; RenderToday(); return; }
             long now = Helpers.NowMs();
             if (!force && now < pollPausedUntil) return;
             try
             {
-                if (catalog == null) catalog = await ZkEngine.CatalogAsync();
+                // Every refresh takes the current catalog (new texts after a 6 h refresh or a refused save reach the open window).
+                await ReloadCatalogAsync();
                 var answer = await ZkEngine.TodayAsync();
                 if (closed) return;
                 if (answer == null) { pollPausedUntil = Helpers.NowMs() + 60000; RenderToday(); return; }
@@ -374,9 +370,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             var s = ZkEngine.Snapshot().Session;
             todayTitle.Text = TodayRules.TodayTitle(Helpers.NowMs(), TimeZoneInfo.Local);
             catalogLoading.Visibility = catalog == null && s.HasToken ? Visibility.Visible : Visibility.Collapsed;
-            var pending = new HashSet<long>(s.SavingTradeIds ?? new List<long>());
-            foreach (long id in queuedNow.ToList()) { if (pending.Contains(id)) queuedNow.Remove(id); else pending.Add(id); }
-            var rows = TodayRules.Rows(today, pending, newIds);
+            var rows = TodayRules.Rows(today, s.SavingTradeIds, newIds);
             todayList.Children.Clear();
             emptyText.Visibility = today != null && rows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             bool running = panel.Running;
@@ -390,7 +384,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 if (row.State == RowState.Reset)
                 {
                     var button = new Button { Content = UiText.ResetButton, Padding = new Thickness(10, 2, 10, 2), IsEnabled = catalog != null && !running };
-                    button.Click += delegate { Guard("Could not open the reset", () => { if (catalog == null || panel.Running) return; newIds.Remove(trade.Id); OpenReset(trade); }); };
+                    button.Click += delegate { Guard("Could not open the reset", () => { if (catalog == null || panel.Running) return; var task = OpenResetAsync(trade); }); };
                     right.Children.Add(button);
                 }
                 else right.Children.Add(new TextBlock { Text = row.State == RowState.Logged ? UiText.LoggedTag : UiText.SavingTag, VerticalAlignment = VerticalAlignment.Center });

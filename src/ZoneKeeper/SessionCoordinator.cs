@@ -275,7 +275,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     }
                     else Apply(result, nowMs);
                 }
-                else if (state != ZkStatus.Connected || resets == null || resets.Peek() == null)
+                else if (state != ZkStatus.Connected || resets == null || resets.Peek(nowMs) == null)
                 {
                     var result = await api.PingAsync(settings.Token, cancellation).ConfigureAwait(false);
                     cancellation.ThrowIfCancellationRequested();
@@ -292,8 +292,10 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 }
                 // Resets go after the trades: one per loop, only while Connected and no trade is waiting.
                 ZkStatus after; lock (stateGate) after = status;
-                if (after == ZkStatus.Connected && resets != null && resets.Peek() != null && outbox.Peek(1).Count == 0 && !cancellation.IsCancellationRequested)
-                    saved = await SendOneResetAsync(resets.Peek(), nowMs, cancellation).ConfigureAwait(false);
+                var dueReset = after == ZkStatus.Connected && resets != null && outbox.Peek(1).Count == 0 && !cancellation.IsCancellationRequested ? resets.Peek(nowMs) : null;
+                if (dueReset != null) saved = await SendOneResetAsync(dueReset, nowMs, cancellation).ConfigureAwait(false);
+                // A deferred line wakes the loop at its retry time.
+                if (resets != null) { long wake = resets.NextDueMs; lock (stateGate) if (status == ZkStatus.Connected && wake < nextTryMs) nextTryMs = Math.Max(wake, nowMs); }
                 Publish();
             }
             catch (OperationCanceledException) { }
@@ -305,7 +307,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         }
         private sealed class SavedReset { public ResetLine Line; public bool Logged; }
         // Answers (plan 31 section 2.5): 200 and 409 → gone, row Logged; 400 → gone, row back to Reset, one log line;
-        // 401 / 403 / 429 / no answer → the normal policy, the line waits.
+        // 401 / 403 / 429 / no answer → the normal policy, the line waits. Any other server answer (404, 5xx, ...) is this
+        // line's own problem: it backs off (5 s, 15 s, 30 s, 60 s) and is dropped after ResetMaxTries, trade sending untouched.
         private async Task<SavedReset> SendOneResetAsync(ResetLine line, long nowMs, CancellationToken cancellation)
         {
             var result = await api.SaveResetAsync(settings.Token, line.Body, cancellation).ConfigureAwait(false);
@@ -323,12 +326,36 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     if (error.IndexOf("logic_id", StringComparison.OrdinalIgnoreCase) >= 0 || error.IndexOf("thought", StringComparison.OrdinalIgnoreCase) >= 0) catalogStale = true;
                 }
                 Apply(new ApiResult { Kind = ApiKind.Ok }, nowMs);
-                int remaining = resets.Count + outbox.Count;
-                lock (stateGate) { if (result.Kind != ApiKind.BadRequest) lastSentMs = nowMs; nextTryMs = remaining != 0 ? nowMs : nowMs + 300000; }
+                lock (stateGate) if (result.Kind != ApiKind.BadRequest) lastSentMs = nowMs;
+                ScheduleNextReset(nowMs);
                 done = new SavedReset { Line = line, Logged = result.Kind != ApiKind.BadRequest };
             }
-            else Apply(result, nowMs);
+            else if (result.Kind == ApiKind.NotConnected || result.Kind == ApiKind.NotPaid || result.Kind == ApiKind.TooMany || result.Kind == ApiKind.TooManyTries || result.Status == 0)
+                Apply(result, nowMs);
+            else
+            {
+                line.Attempts++;
+                if (line.Attempts >= ResetRules.ResetMaxTries)
+                {
+                    if (!resets.Remove(line.RequestId)) { Apply(new ApiResult { Kind = ApiKind.Offline }, nowMs); return null; }
+                    log.Write(UiText.ResetGaveUp(line.Attempts, (result.Status == 0 ? "" : result.Status.ToString(CultureInfo.InvariantCulture) + " ") + (result.Error ?? "")));
+                    ScheduleNextReset(nowMs);
+                    done = new SavedReset { Line = line, Logged = false };
+                }
+                else
+                {
+                    line.NextTryMs = nowMs + ResetRules.RetryDelayMs(line.Attempts - 1, result.RetryAfter);
+                    // Nothing else is due now: the loop sleeps until this line's retry time (set after this call) or the next ping.
+                    lock (stateGate) if (nextTryMs <= nowMs) nextTryMs = nowMs + 300000;
+                }
+            }
             return done;
+        }
+        // After a reset left the queue: more work due now → at once; else the normal 5-minute ping.
+        private void ScheduleNextReset(long nowMs)
+        {
+            bool more = outbox.Count != 0 || resets.Peek(nowMs) != null;
+            lock (stateGate) nextTryMs = more ? nowMs : nowMs + 300000;
         }
         // Today's trades, the catalog and the audio run outside the serial lock (a 60-second audio download must never
         // delay a trade send). Only 401 and 403 not_paid change the connection, and only while the same key is still set.

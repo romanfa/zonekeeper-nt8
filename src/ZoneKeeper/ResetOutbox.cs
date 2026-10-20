@@ -15,6 +15,9 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         [DataMember(Name = "exit_time")] public long ExitTime { get; set; }
         [DataMember(Name = "queued_at")] public long QueuedAt { get; set; }
         [DataMember(Name = "body")] public ResetBody Body { get; set; }
+        // Retry state for this engine run only (not saved): 404 / 5xx answers back off per line.
+        public int Attempts { get; set; }
+        public long NextTryMs { get; set; }
     }
 
     // Finished resets waiting to be sent (resets.jsonl). Written and flushed before the panel closes.
@@ -31,6 +34,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             path = filePath; files = store; log = writeLog ?? delegate { };
             Load();
         }
+        // An unreadable file throws: the engine waits and tries again (as for outbox.jsonl). Waiting resets are never overwritten.
         private void Load()
         {
             try
@@ -47,7 +51,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 if (damaged != 0) log("Skipped " + damaged + " damaged reset lines.");
                 if (rows.Count > Limit) { rows.RemoveRange(0, rows.Count - Limit); log(UiText.ResetQueueFull); Write(); }
             }
-            catch (Exception) { log(UiText.SaveFailed); }
+            catch (Exception) { log(UiText.SaveFailed); throw; }
         }
         public int Count { get { lock (gate) return rows.Count; } }
         public List<long> PendingTradeIds { get { lock (gate) return rows.Select(x => x.TradeId).Distinct().ToList(); } }
@@ -65,6 +69,10 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             }
         }
         public ResetLine Peek() { lock (gate) return rows.Count == 0 ? null : rows[0]; }
+        // The oldest line whose retry time has come.
+        public ResetLine Peek(long nowMs) { lock (gate) return rows.FirstOrDefault(x => x.NextTryMs <= nowMs); }
+        // When the earliest waiting line may be tried; long.MaxValue when nothing waits.
+        public long NextDueMs { get { lock (gate) return rows.Count == 0 ? long.MaxValue : rows.Min(x => x.NextTryMs); } }
         // The line leaves memory only when the file was written; a failed write means "try again later".
         public bool Remove(string requestId)
         {

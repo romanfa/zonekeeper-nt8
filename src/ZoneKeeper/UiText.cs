@@ -32,6 +32,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public const string ResetDoneElsewhere = "Already done on another device.";
         public static string ResetRefused(string error) { return "The server refused this reset: " + Helpers.Cut(error, 160); }
         public const string ResetQueueFull = "Waiting list of resets is full (100). The oldest was dropped.";
+        public const string ResetSaveRetry = "Could not save the reset. Tap your tilt again.";
+        public static string ResetGaveUp(int tries, string error) { return "Gave up on a reset after " + tries.ToString(CultureInfo.InvariantCulture) + " tries: " + Helpers.Cut(error, 160); }
         public static string AudioLoading(int percent) { return "Loading audio… " + Math.Max(0, Math.Min(100, percent)).ToString(CultureInfo.InvariantCulture) + " %"; }
         public const string AudioNeedsConnection = "Audio needs a connection. The reset runs with the timer.";
         public const string AudioNotPaid = "Your ZoneKeeper plan is not active. Renew it on getzonekeeper.com.";

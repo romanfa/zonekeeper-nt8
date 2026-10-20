@@ -2,6 +2,7 @@
 // Made and used on the window's dispatcher only. Close() stops the sound and deletes the temp file.
 using System;
 using System.IO;
+using System.Threading.Tasks;
 using System.Windows.Media;
 using System.Windows.Threading;
 
@@ -41,18 +42,32 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         }
         public void Play() { if (path == null) return; player.Play(); IsPaused = false; tick.Start(); }
         public void Pause() { if (path == null) return; player.Pause(); IsPaused = true; }
-        // Stop the sound, let go of the file, delete it. A locked file is left for the wipe at the next start.
+        // Stop the sound, let go of the file, delete it. The media thread may still hold the file for a moment,
+        // so a failed delete is tried again every 250 ms for 5 s on a background thread. The wipe at the next
+        // engine start / window open / stop is the last net.
         public void Close()
         {
             tick.Stop();
             string file = path; path = null; IsPaused = false;
             try { player.Stop(); player.Close(); } catch (Exception) { }
-            TryDelete(file);
+            DeleteWithRetries(file);
         }
-        public static void TryDelete(string file)
+        public static void DeleteWithRetries(string file)
         {
-            if (string.IsNullOrEmpty(file)) return;
-            try { if (File.Exists(file)) File.Delete(file); } catch (Exception) { }
+            if (string.IsNullOrEmpty(file) || TryDelete(file)) return;
+            Task.Run(async () => {
+                for (int i = 0; i < 20; i++)
+                {
+                    await Task.Delay(250).ConfigureAwait(false);
+                    if (TryDelete(file)) return;
+                }
+                ZkEngine.Note("Could not delete the voice temp file yet. It is wiped at the next start.");
+            });
+        }
+        private static bool TryDelete(string file)
+        {
+            try { if (File.Exists(file)) File.Delete(file); return true; }
+            catch (Exception) { return false; }
         }
         private static void Raise(Action handler) { if (handler != null) try { handler(); } catch (Exception) { } }
     }

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using NinjaTrader.NinjaScript.AddOns.ZoneKeeper;
 using Xunit;
@@ -68,6 +69,37 @@ namespace ZoneKeeper.Tests
             files.Write("resets.jsonl", string.Join("\n", Enumerable.Range(1, 105).Select(i => Json.Write(new ResetLine { RequestId = i.ToString("x32"), TradeId = i, Body = Body(i, i.ToString("x32")) }))) + "\n");
             var loaded = new ResetOutbox("resets.jsonl", files, logs.Add);
             Assert.Equal(100, loaded.Count); Assert.Equal(6, loaded.Peek().TradeId);
+        }
+        [Fact]
+        public void O6_AnUnreadableFileThrowsAndNothingIsOverwritten()
+        {
+            var files = new ThrowingReadFiles(); var logs = new List<string>();
+            files.Write("resets.jsonl", "keep me\n");
+            Assert.Throws<IOException>(() => new ResetOutbox("resets.jsonl", files, logs.Add));
+            Assert.Equal(new[] { UiText.SaveFailed }, logs.ToArray()); Assert.Equal(1, files.Writes);
+        }
+        [Fact]
+        public void O7_PeekHonoursTheRetryTime()
+        {
+            var box = new ResetOutbox("resets.jsonl", new MemoryFiles(), delegate { });
+            box.Add(Body(812, "a" + new string('0', 31)), 0, 1); box.Add(Body(813, "b" + new string('0', 31)), 0, 2);
+            Assert.Equal(0, box.NextDueMs);
+            var first = box.Peek(Fixtures.Time); Assert.Equal(812, first.TradeId);
+            first.Attempts = 1; first.NextTryMs = Fixtures.Time + 5000;
+            Assert.Equal(813, box.Peek(Fixtures.Time).TradeId); Assert.Equal(0, box.NextDueMs);
+            box.Peek(Fixtures.Time).NextTryMs = Fixtures.Time + 9000;
+            Assert.Null(box.Peek(Fixtures.Time)); Assert.Equal(Fixtures.Time + 5000, box.NextDueMs);
+            Assert.Equal(812, box.Peek(Fixtures.Time + 5000).TradeId);
+            box.Remove(first.RequestId); box.Remove(box.Peek().RequestId);
+            Assert.Equal(long.MaxValue, box.NextDueMs); Assert.Null(box.Peek(long.MaxValue));
+        }
+        private sealed class ThrowingReadFiles : IAtomicFileStore
+        {
+            private readonly Dictionary<string, string> data = new Dictionary<string, string>();
+            public int Writes;
+            public bool Exists(string path) { return data.ContainsKey(path); }
+            public string Read(string path) { throw new IOException("locked by another program"); }
+            public void Write(string path, string text) { Writes++; data[path] = text; }
         }
         [Fact]
         public void O5_AWriteFailureKeepsNothingAndSaysSo()

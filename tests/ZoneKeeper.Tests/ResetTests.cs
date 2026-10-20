@@ -453,6 +453,65 @@ namespace ZoneKeeper.Tests
             }
         }
         [Fact]
+        public async Task R9_A404OrServerErrorBacksOffPerLineAndIsDroppedAfterTwentyTries()
+        {
+            using (var s = new Scope())
+            {
+                long now = Fixtures.Time;
+                await s.Step(now);
+                var body = s.QueueReset(812, now - 100000);
+                long[] waits = { 5000, 15000, 30000, 60000 };
+                for (int attempt = 1; attempt < ResetRules.ResetMaxTries; attempt++)
+                {
+                    s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.Offline, Status = attempt % 2 == 0 ? 503 : 404, Error = "not found" });
+                    await s.Step(now);
+                    long wait = waits[Math.Min(attempt - 1, waits.Length - 1)];
+                    // The connection is untouched: Connected, the loop wakes at the line's retry time, nothing else is tried before.
+                    Assert.Equal(attempt, s.Api.Resets); Assert.Equal(ZkStatus.Connected, s.Session.Snapshot().Status);
+                    Assert.Equal(now + wait, s.Session.Snapshot().NextTryMs); Assert.Equal(1, s.Resets.Count); Assert.Empty(s.Saved);
+                    await s.Step(now + wait - 1); Assert.Equal(attempt, s.Api.Resets);
+                    now += wait;
+                }
+                // A trade in between goes first and is not slowed down; the 20th failure drops the line with one log line.
+                s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.Offline, Status = 503, Error = "not found" });
+                s.Queue.Add(Fixtures.Trade()); await s.Step(now);
+                Assert.Equal(1, s.Api.Sends); Assert.Equal(0, s.Queue.Count); Assert.Equal(ResetRules.ResetMaxTries, s.Api.Resets);
+                Assert.Equal(body.RequestId, s.Api.ResetBodies[s.Api.ResetBodies.Count - 1].RequestId);
+                Assert.Equal(0, s.Resets.Count); Assert.Equal(new[] { "812:refused" }, s.Saved.ToArray());
+                Assert.Equal(1, s.Log.Recent.Count(x => x.Contains("Gave up on a reset after 20 tries: 503 not found")));
+                Assert.Equal(ZkStatus.Connected, s.Session.Snapshot().Status);
+                // No answer at all (status 0) is still the connection policy.
+                s.QueueReset(813, now - 50000);
+                s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.Offline, Error = "No answer from getzonekeeper.com." });
+                await s.Step(now);
+                Assert.Equal(ZkStatus.Offline, s.Session.Snapshot().Status); Assert.Equal(now + 15000, s.Session.Snapshot().NextTryMs); Assert.Equal(1, s.Resets.Count);
+            }
+        }
+        [Fact]
+        public async Task R9_ADeferredLineDoesNotStopThePingOrOtherLines()
+        {
+            using (var s = new Scope())
+            {
+                long now = Fixtures.Time;
+                await s.Step(now);
+                s.QueueReset(812, now - 100000);
+                s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.Offline, Status = 500 });
+                await s.Step(now);
+                Assert.Equal(1, s.Resets.Count); Assert.Equal(1, s.Api.Resets);
+                // A second line that is due goes now; the deferred one waits for its time.
+                s.QueueReset(813, now - 50000); await s.Step(now + 1000);
+                Assert.Equal(2, s.Api.Resets); Assert.Equal(813, s.Api.ResetBodies[1].TradeId); Assert.Equal(new[] { "813:logged" }, s.Saved.ToArray());
+                // Nothing due: the loop sleeps until the retry time (no ping, no call: the 600/h bucket is not touched).
+                Assert.Equal(now + 5000, s.Session.Snapshot().NextTryMs);
+                await s.Step(now + 2000);
+                Assert.Equal(new[] { "ping", "reset", "reset" }, s.Api.Order.ToArray());
+                await s.Step(now + 5000);
+                Assert.Equal(new[] { "ping", "reset", "reset", "reset" }, s.Api.Order.ToArray());
+                Assert.Equal(3, s.Api.Resets); Assert.Equal(0, s.Resets.Count); Assert.Equal(new[] { "813:logged", "812:logged" }, s.Saved.ToArray());
+                Assert.Equal(now + 5000 + 300000, s.Session.Snapshot().NextTryMs);
+            }
+        }
+        [Fact]
         public async Task R9_NothingIsSentWhileNotConnectedOrPaused()
         {
             using (var s = new Scope(connected: false))

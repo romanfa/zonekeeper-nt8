@@ -145,6 +145,16 @@ namespace ZoneKeeper.Tests
             Assert.Null(none.Trigger); Assert.Empty(none.Thoughts); Assert.False(none.RateBefore(3, Tap1));
         }
         [Fact]
+        public void S11_AFailedWriteGoesBackToStepFiveWithTheSameRequestId()
+        {
+            var s = AtAudio(); s.FinishAudio();
+            Assert.False(s.SaveFailed());
+            var first = s.RateAgain(3, Tap1); Assert.True(s.IsSaved);
+            Assert.True(s.SaveFailed()); Assert.Equal(5, s.Step); Assert.True(s.CanRateAgain); Assert.False(s.IsSaved); Assert.False(s.Interruptible);
+            var again = s.RateAgain(4, Tap1 + 1000);
+            Assert.Equal(first.RequestId, again.RequestId); Assert.Equal(4, again.TiltAfter); Assert.Equal("b21", again.AudioId); Assert.True(s.IsSaved);
+        }
+        [Fact]
         public void S10_StepLinesAndLabels()
         {
             Assert.Equal("Step 1 of 5 — Rate your tilt", UiText.StepLine(1));

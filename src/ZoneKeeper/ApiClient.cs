@@ -116,6 +116,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                     limit.CancelAfter(AudioRules.DownloadTimeoutMs);
                     if (token != null) request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
                     using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, limit.Token).ConfigureAwait(false))
+                    // On .NET Framework a hanging read ignores the token: disposing the response breaks it.
+                    using (limit.Token.Register(() => { try { response.Dispose(); } catch (Exception) { } }))
                     {
                         int status = (int)response.StatusCode;
                         long? length = response.Content == null ? null : response.Content.Headers.ContentLength;

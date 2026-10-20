@@ -13,9 +13,11 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
 {
     public sealed class ResetPanel : Border
     {
-        private static readonly Brush Green = new SolidColorBrush(Color.FromRgb(0x2e, 0x7d, 0x32));
-        private static readonly Brush Orange = new SolidColorBrush(Color.FromRgb(0xef, 0x6c, 0x00));
-        private static readonly Brush Red = new SolidColorBrush(Color.FromRgb(0xc6, 0x28, 0x28));
+        // Frozen: a frozen brush may be used by a window on any NinjaTrader UI thread.
+        private static readonly Brush Green = Frozen(Color.FromRgb(0x2e, 0x7d, 0x32));
+        private static readonly Brush Orange = Frozen(Color.FromRgb(0xef, 0x6c, 0x00));
+        private static readonly Brush Red = Frozen(Color.FromRgb(0xc6, 0x28, 0x28));
+        private static Brush Frozen(Color color) { var brush = new SolidColorBrush(color); brush.Freeze(); return brush; }
         private readonly TextBlock header = Text("", true);
         private readonly TextBlock stepLine = Text("", false);
         private readonly TextBlock note = Text("", false);
@@ -26,6 +28,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private CancellationTokenSource loading;
         private double timerSeconds;
         private bool paused;
+        private bool saving;
         private string audioPath;
         // Audio view controls (made once per audio phase).
         private TextBlock partLine, partText, partSay, roundLine, leftText;
@@ -33,7 +36,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private Button pause;
         public ResetSession Session { get; private set; }
         public TimeZoneInfo Zone { get; set; }
-        // The step-5 tap: the window queues the body, shows the rule text and marks the row.
+        // The step-5 tap, after the body is on disk (resets.jsonl): the window shows the rule text and the row "Saving…".
         public event Action<ResetSession, ResetBody> Saved;
         // The panel went away without a save (Back to today, Stop for today, plan not active, key gone).
         public event Action<ResetSession> Closed;
@@ -78,13 +81,13 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             timer.Stop(); paused = false; timerSeconds = 0;
             if (loading != null) { try { loading.Cancel(); } catch (ObjectDisposedException) { } loading = null; }
             if (player != null) player.Close();
-            AudioPlayer.TryDelete(audioPath); audioPath = null;
+            AudioPlayer.DeleteWithRetries(audioPath); audioPath = null;
         }
 
         private void Render()
         {
             var s = Session;
-            body.Children.Clear();
+            body.Children.Clear(); body.IsEnabled = true;
             if (s == null) return;
             stepLine.Text = UiText.StepLine(s.Step);
             if (s.Step == 1) { AddTiltGrid(n => { if (s.RateBefore(n, Helpers.NowMs())) Render(); }); return; }
@@ -119,13 +122,29 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             {
                 AddTiltGrid(n => {
                     var reset = Session;
-                    if (reset == null) return;
+                    if (reset == null || saving) return;
                     var saved = reset.RateAgain(n, Helpers.NowMs());
-                    if (saved == null) return;
-                    Close(false);
-                    var handler = Saved; if (handler != null) handler(reset, saved);
+                    if (saved != null) SaveAsync(reset, saved);
                 });
             }
+        }
+        // The step-5 tap: first the line in resets.jsonl (written and flushed), only then the panel closes.
+        // A failed write keeps step 5 open with a clear text; the next tap sends the same request_id.
+        private async void SaveAsync(ResetSession s, ResetBody body)
+        {
+            saving = true; this.body.IsEnabled = false;
+            bool ok;
+            try { ok = await ZkEngine.QueueResetAsync(body, s.Trade.ExitTime); }
+            catch (Exception ex) { ZkEngine.ReportError("Could not save the reset", ex); ok = false; }
+            saving = false;
+            try
+            {
+                if (Session != s) return;
+                if (!ok) { s.SaveFailed(); note.Text = UiText.ResetSaveRetry; note.Visibility = Visibility.Visible; Render(); return; }
+                Close(false);
+                var handler = Saved; if (handler != null) handler(s, body);
+            }
+            catch (Exception ex) { ZkEngine.ReportError("Could not finish the reset", ex); }
         }
         private void AddTiltGrid(Action<int> tap)
         {
@@ -184,7 +203,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             {
                 if (loading == token) { loading = null; token.Dispose(); }
                 // Closed, skipped or replaced while loading: the file is deleted and nothing else happens.
-                if (Session != s || !s.AudioPhase) { AudioPlayer.TryDelete(result.Path); return; }
+                if (Session != s || !s.AudioPhase) { AudioPlayer.DeleteWithRetries(result.Path); return; }
                 if (result.Kind == ApiKind.NotPaid) { Close(true); var handler = NotPaid; if (handler != null) handler(); return; }
                 if (result.Kind == ApiKind.NotConnected) { Close(true); return; }
                 if (result.Kind != ApiKind.Ok || string.IsNullOrEmpty(result.Path)) { StartTimer(s, UiText.AudioNeedsConnection); return; }
@@ -204,7 +223,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             catch (Exception ex)
             {
                 ZkEngine.ReportError("Could not play the voice", ex);
-                AudioPlayer.TryDelete(result.Path); audioPath = null;
+                AudioPlayer.DeleteWithRetries(result.Path); audioPath = null;
                 if (Session == s && s.AudioPhase) { ZkEngine.Note(UiText.AudioFailed); StartTimer(s, UiText.AudioFailed); }
             }
         }

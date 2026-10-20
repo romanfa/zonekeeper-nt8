@@ -99,6 +99,12 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             TiltAfter = n; Step = Saved;
             return Body(nowMs);
         }
+        // The write to resets.jsonl failed: back to step 5, same request_id; the next tap builds the body again.
+        public bool SaveFailed()
+        {
+            if (Step != Saved) return false;
+            Step = 5; return true;
+        }
         public ResetBody Body(long nowMs)
         {
             return new ResetBody {

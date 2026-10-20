@@ -56,11 +56,14 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         }
         public static void Stop(object owner)
         {
+            Run run = null;
             lock (gate)
             {
                 if (ReferenceEquals(pendingOwner, owner)) pendingOwner = null;
-                if (current != null && ReferenceEquals(current.Owner, owner)) current.BeginStop();
+                if (current != null && ReferenceEquals(current.Owner, owner)) { run = current; run.MarkStopping(); }
             }
+            // Outside the lock: BeginStop reaches the window, and a window being built reads the engine (lock order).
+            if (run != null) run.BeginStop();
             // No joining, HTTP, DPAPI, or file writes on the NinjaTrader lifecycle thread.
         }
         private static Run ActiveRun() { lock (gate) return current; }
@@ -195,10 +198,12 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 log = new EventLog(folder); log.Changed += Publish;
             }
             public void Launch() { lifetime = Task.Run((Func<Task>)LifetimeAsync); }
+            public void MarkStopping() { stopping = true; }
             public void BeginStop()
             {
                 stopping = true;
                 ZoneKeeperWindow.StopAudio();
+                WipeAudioTemp();
                 cancel.Cancel();
                 if (watcher != null) watcher.Stop();
                 work.CompleteAdding();
@@ -332,6 +337,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             public async Task<AudioResult> AudioTempFileAsync(string id, IProgress<int> percent, CancellationToken cancellation)
             {
                 if (stopping || session == null) return new AudioResult { Kind = ApiKind.Offline };
+                string path = null;
                 try
                 {
                     using (var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellation, cancel.Token))
@@ -346,14 +352,19 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                         }
                         string folder = AudioRules.TempFolder(Path.GetTempPath());
                         Directory.CreateDirectory(folder);
-                        string path = Path.Combine(folder, AudioRules.TempName());
+                        path = Path.Combine(folder, AudioRules.TempName());
                         using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                         { memory.Position = 0; memory.CopyTo(file); file.Flush(true); }
                         return new AudioResult { Kind = ApiKind.Ok, Path = path };
                     }
                 }
-                catch (OperationCanceledException) { return new AudioResult { Kind = ApiKind.Offline }; }
-                catch (Exception ex) { log.Error("Could not get the voice for this reset", ex); return new AudioResult { Kind = ApiKind.Offline }; }
+                // A half-written file never stays behind.
+                catch (OperationCanceledException) { DeleteQuietly(path); return new AudioResult { Kind = ApiKind.Offline }; }
+                catch (Exception ex) { DeleteQuietly(path); log.Error("Could not get the voice for this reset", ex); return new AudioResult { Kind = ApiKind.Offline }; }
+            }
+            private static void DeleteQuietly(string path)
+            {
+                try { if (!string.IsNullOrEmpty(path) && File.Exists(path)) File.Delete(path); } catch (Exception) { }
             }
             public bool QueueReset(ResetBody body, long exitMs)
             {
