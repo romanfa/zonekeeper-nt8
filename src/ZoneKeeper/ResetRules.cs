@@ -30,7 +30,10 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
 
         // Picks the trade to open after a good send: the newest fresh trade that the server saved
         // and that this run did not open yet. Trades closed before this NinjaTrader run never open.
-        public static SavedTrade PickTrade(IList<TradeRecord> batch, TradesAnswer answer, long nowMs, long runStartedMs, ICollection<long> opened)
+        // 0.2.1: never while the account still holds a position in that instrument. A reversal's trade never opens; the
+        // trade that later closes flat is the newest and opens (older ones keep Reset). positionOpen gets the account +
+        // instrument key and answers whether a position is open now (null = no check). Other instruments never block.
+        public static SavedTrade PickTrade(IList<TradeRecord> batch, TradesAnswer answer, long nowMs, long runStartedMs, ICollection<long> opened, Func<string, bool> positionOpen = null)
         {
             if (batch == null || answer == null || answer.Ids == null) return null;
             var rejected = new HashSet<int>();
@@ -42,6 +45,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 if (rejected.Contains(item.Index) || (opened != null && opened.Contains(item.Id))) continue;
                 var trade = batch[item.Index];
                 if (trade == null || trade.ExitTime < runStartedMs || nowMs - trade.ExitTime > FreshMs) continue;
+                if (trade.Reversal || (positionOpen != null && trade.PositionKey != null && positionOpen(trade.PositionKey))) continue;
                 if (best == null || trade.ExitTime > bestExit || (trade.ExitTime == bestExit && item.Index > best.Index))
                 { best = new SavedTrade { Index = item.Index, Id = item.Id }; bestExit = trade.ExitTime; }
             }

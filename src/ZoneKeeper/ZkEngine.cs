@@ -449,7 +449,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                             catalogs = new CatalogStore(Path.Combine(folder, "catalog.json"), files, log.Write);
                             resets = new ResetOutbox(Path.Combine(folder, "resets.jsonl"), files, log.Write);
                             api = new ApiClient(settings.BaseUrl, log.ProtectSecret);
-                            session = new SessionCoordinator(settings, outbox, resets, api, log) { RunStartedMs = Helpers.NowMs() };
+                            // PositionOpen: no reset pop-up while the account still holds a position in that instrument.
+                            session = new SessionCoordinator(settings, outbox, resets, api, log) { RunStartedMs = Helpers.NowMs(), PositionOpen = fills.IsOpen };
                             session.Changed += Publish; session.WorkAvailable += Wake;
                             // A fresh closed trade: the window comes up with its reset (never on NinjaTrader's threads: the window dispatches itself).
                             session.ResetWanted += id => { if (!stopping) ZoneKeeperWindow.RaiseForTrade(id); };

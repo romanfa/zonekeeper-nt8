@@ -57,6 +57,12 @@ namespace ZoneKeeper.Tests
                 Assert.True(Resets.Add(body, exitMs, exitMs + 240000)); Session.NotifyQueued();
                 return body;
             }
+            // The fill worker for the end-to-end tests: fills → trades → outbox, plus the "position still open?" check.
+            public FillCoordinator Track()
+            {
+                var fills = new FillCoordinator(new TradeBuilder(TimeZoneInfo.Utc, delegate { }), new OpenTradesFile("open", Files, delegate { }), Queue);
+                Session.PositionOpen = fills.IsOpen; return fills;
+            }
             public Task Step(long now) { return Session.ProcessAsync(now, CancellationToken.None); }
             // Ping once, then send the given trades in one batch at "now" with the given answer.
             public async Task Send(long now, ApiResult answer, params TradeRecord[] trades)
@@ -78,6 +84,12 @@ namespace ZoneKeeper.Tests
         private static List<TradeRecord> Batch(params long[] exits) { return exits.Select((x, i) => TradeAt("exit" + i, x)).ToList(); }
         private static TradesAnswer Ids(params long[] ids)
         { return new TradesAnswer { Rejected = new List<RejectedTrade>(), Ids = ids.Select((id, index) => new SavedTrade { Index = index, Id = id }).ToList() }; }
+        // A fill at Time + atMs; position = NinjaTrader's signed position after it.
+        private static Fill At(string id, bool buy, int qty, int position, long atMs, string instrument = "MNQ 12-26", string account = "Sim101")
+        {
+            var fill = Fixtures.Fill(id, buy, qty, 21000, position, 0, account, instrument);
+            fill.TimeMs = Fixtures.Time + atMs; fill.ArrivedMs = fill.TimeMs + 1000; return fill;
+        }
 
         // R1 + R2
         [Fact]
@@ -256,6 +268,130 @@ namespace ZoneKeeper.Tests
                 var trade = Fixtures.Trade();
                 await s.Send(trade.ExitTime + 11 * 60000, Saved(812), trade);
                 Assert.Empty(s.Opened); Assert.Equal(0, s.Queue.Count);
+            }
+        }
+        // R10 (0.2.1, guide 32 W5): never raise the reset while the account still has a position in that instrument.
+        [Fact]
+        public void R10_PickTradeSkipsReversalsAndTradesWhosePositionIsStillOpen()
+        {
+            long now = Fixtures.Time;
+            var batch = Batch(now - 5000, now - 1000);
+            batch[1].Reversal = true;
+            Assert.Equal(640, ResetRules.PickTrade(batch, Ids(640, 641), now, 0, null).Id);
+            batch[1].Reversal = false; batch[0].PositionKey = "es"; batch[1].PositionKey = "mnq";
+            Assert.Equal(640, ResetRules.PickTrade(batch, Ids(640, 641), now, 0, null, key => key == "mnq").Id);
+            Assert.Null(ResetRules.PickTrade(batch, Ids(640, 641), now, 0, null, key => true));
+            Assert.Equal(641, ResetRules.PickTrade(batch, Ids(640, 641), now, 0, null, key => false).Id);
+            // No key (a trade restored from disk): nothing to check.
+            batch[1].PositionKey = null;
+            Assert.Equal(641, ResetRules.PickTrade(batch, Ids(640, 641), now, 0, null, key => true).Id);
+        }
+        [Fact]
+        public async Task R10_W5_ReversalWaitsForFlatThenOpensOnceForTheNewestTrade()
+        {
+            using (var s = new Scope())
+            {
+                var fills = s.Track(); long now = Fixtures.Time + 120000; string mnq = Helpers.PairKey("Sim101", "MNQ 12-26");
+                await s.Step(now);
+                fills.Apply(At("buy1", true, 1, 1, 0));
+                fills.Apply(At("sell2", false, 2, -1, 10000));
+                // The long trade is sent and listed as usual, but the account is short 1: no window.
+                s.Api.SendAnswers.Enqueue(Saved(700)); await s.Step(now);
+                Assert.Equal(1, s.Api.Sends); Assert.Equal(0, s.Queue.Count); Assert.Empty(s.Opened); Assert.True(fills.IsOpen(mnq));
+                await s.Step(now + 60000); Assert.Empty(s.Opened);
+                // buy 1 closes the short: flat, the window opens once, for the short (the newest trade).
+                fills.Apply(At("buy1b", true, 1, 0, 70000));
+                s.Api.SendAnswers.Enqueue(Saved(701)); await s.Step(now + 70000);
+                Assert.Equal(2, s.Api.Sends); Assert.Equal(new long[] { 701 }, s.Opened); Assert.False(fills.IsOpen(mnq));
+            }
+        }
+        [Fact]
+        public async Task R10_AReversalTradeNeverOpensEvenWhenTheShortClosesDuringItsSend()
+        {
+            using (var s = new Scope())
+            {
+                var fills = s.Track(); long now = Fixtures.Time + 120000;
+                await s.Step(now);
+                fills.Apply(At("buy1", true, 1, 1, 0)); fills.Apply(At("sell2", false, 2, -1, 10000));
+                // The buy 1 that closes the short arrives while the long trade is on its way to the site.
+                s.Api.SendOverride = c => { s.Api.SendOverride = null; fills.Apply(At("buy1b", true, 1, 0, 20000)); return Task.FromResult(Saved(700)); };
+                await s.Step(now);
+                Assert.Empty(s.Opened); Assert.Equal(1, s.Queue.Count);
+                s.Api.SendAnswers.Enqueue(Saved(701)); await s.Step(now);
+                Assert.Equal(new long[] { 701 }, s.Opened);
+            }
+        }
+        [Fact]
+        public async Task R10_ReversalAndFlatInOneSendOpenOnlyTheFlatTrade()
+        {
+            using (var s = new Scope())
+            {
+                var fills = s.Track(); long now = Fixtures.Time + 120000;
+                await s.Step(now);
+                fills.Apply(At("buy1", true, 1, 1, 0)); fills.Apply(At("sell2", false, 2, -1, 10000)); fills.Apply(At("buy1b", true, 1, 0, 20000));
+                Assert.Equal(2, s.Queue.Count);
+                s.Api.SendAnswers.Enqueue(Saved(700, 701)); await s.Step(now);
+                Assert.Equal(new long[] { 701 }, s.Opened);
+            }
+        }
+        [Fact]
+        public async Task R10_W4_PartialClosesStillOpenOnceAtTheLastSell()
+        {
+            using (var s = new Scope())
+            {
+                var fills = s.Track(); long now = Fixtures.Time + 120000;
+                await s.Step(now);
+                fills.Apply(At("buy3", true, 3, 3, 0));
+                fills.Apply(At("sell1a", false, 1, 2, 10000)); fills.Apply(At("sell1b", false, 1, 1, 20000));
+                await s.Step(now);
+                Assert.Equal(0, s.Api.Sends); Assert.Equal(0, s.Queue.Count); Assert.Empty(s.Opened);
+                fills.Apply(At("sell1c", false, 1, 0, 30000));
+                var trade = Assert.Single(s.Queue.Peek(20)).Trade; Assert.Equal(3, trade.Qty); Assert.False(trade.Reversal);
+                s.Api.SendAnswers.Enqueue(Saved(710)); await s.Step(now);
+                Assert.Equal(1, s.Api.Sends); Assert.Equal(new long[] { 710 }, s.Opened);
+            }
+        }
+        [Fact]
+        public async Task R10_W6_TwoQuickTradesOpenOnlyTheNewer()
+        {
+            using (var s = new Scope())
+            {
+                var fills = s.Track(); long now = Fixtures.Time + 120000;
+                await s.Step(now);
+                fills.Apply(At("a1", true, 1, 1, 0)); fills.Apply(At("a2", false, 1, 0, 10000));
+                fills.Apply(At("b1", true, 1, 1, 20000)); fills.Apply(At("b2", false, 1, 0, 30000));
+                s.Api.SendAnswers.Enqueue(Saved(720, 721)); await s.Step(now);
+                Assert.Equal(new long[] { 721 }, s.Opened);
+            }
+        }
+        [Fact]
+        public async Task R10_APositionInAnotherInstrumentOrAccountDoesNotBlockTheReset()
+        {
+            using (var s = new Scope())
+            {
+                var fills = s.Track(); long now = Fixtures.Time + 120000;
+                await s.Step(now);
+                fills.Apply(At("mnq", true, 1, 1, 0));
+                fills.Apply(At("sim102", false, 1, -1, 0, "ES 12-26", "Sim102"));
+                fills.Apply(At("es1", true, 1, 1, 10000, "ES 12-26")); fills.Apply(At("es2", false, 1, 0, 20000, "ES 12-26"));
+                s.Api.SendAnswers.Enqueue(Saved(730)); await s.Step(now);
+                Assert.Equal(new long[] { 730 }, s.Opened);
+            }
+        }
+        [Fact]
+        public async Task R10_ATradeSentAfterANewEntryWaitsAndTheNextFlatTradeOpens()
+        {
+            using (var s = new Scope())
+            {
+                var fills = s.Track(); long now = Fixtures.Time + 120000;
+                await s.Step(now);
+                // The trade is still waiting to be sent when the member enters again.
+                fills.Apply(At("a1", true, 1, 1, 0)); fills.Apply(At("a2", false, 1, 0, 10000)); fills.Apply(At("b1", true, 1, 1, 20000));
+                s.Api.SendAnswers.Enqueue(Saved(740)); await s.Step(now);
+                Assert.Equal(1, s.Api.Sends); Assert.Empty(s.Opened);
+                fills.Apply(At("b2", false, 1, 0, 30000));
+                s.Api.SendAnswers.Enqueue(Saved(741)); await s.Step(now);
+                Assert.Equal(new long[] { 741 }, s.Opened);
             }
         }
         [Fact]

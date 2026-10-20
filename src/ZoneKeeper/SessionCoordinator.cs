@@ -59,6 +59,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public event Action<long, bool> ResetSaved;
         // Engine start time. Trades closed before it never raise the window (no pop-up after a restart).
         public long RunStartedMs { get; set; }
+        // True while the account still holds a position in this instrument (key = account + instrument). Null = no check.
+        public Func<string, bool> PositionOpen { get; set; }
         public SessionCoordinator(Settings localSettings, OutboxQueue queue, IAddonApi client, EventLog eventLog) : this(localSettings, queue, null, client, eventLog) { }
         public SessionCoordinator(Settings localSettings, OutboxQueue queue, ResetOutbox resetQueue, IAddonApi client, EventLog eventLog)
         {
@@ -268,7 +270,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                             if (outbox.Count == 0) singles = false;
                             if (settings.AutoReset)
                             {
-                                var pick = ResetRules.PickTrade(batch.Select(x => x.Trade).ToList(), answer, nowMs, RunStartedMs, opened);
+                                var pick = ResetRules.PickTrade(batch.Select(x => x.Trade).ToList(), answer, nowMs, RunStartedMs, opened, PositionOpen);
                                 if (pick != null) { resetId = pick.Id; RememberOpened(pick.Id); log.Write(UiText.ResetOpened(batch[pick.Index].Trade.ExitTime)); }
                             }
                         }

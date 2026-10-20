@@ -13,6 +13,10 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         private readonly OutboxQueue outbox;
         private readonly List<TradeRecord> pending;
         private bool dirty = true;
+        // Account + instrument keys with a position open now (known or unknown start). Written by the fill worker after
+        // every change, read by the sender (the reset raise rule), so it is a copy behind its own lock.
+        private readonly object positionsGate = new object();
+        private HashSet<string> openPositions = new HashSet<string>(StringComparer.Ordinal);
         public FillCoordinator(TradeBuilder builder, OpenTradesFile file, OutboxQueue queue)
         {
             Builder = builder; openFile = file; outbox = queue;
@@ -27,6 +31,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             {
                 if (operation == "Update" || operation == "Remove") { outbox.Correct(fill, pending); DropInvalidated(); }
                 foreach (var trade in Builder.Process(fill)) if (!pending.Any(x => x.Key == trade.Key)) pending.Add(trade);
+                // Before the outbox hand-off: the sender must see the position of a trade it is about to send.
+                PublishPositions();
                 if (pending.Count > 500) { pending.RemoveRange(0, pending.Count - 500); outbox.LogFull(); }
                 dirty = true;
                 RetryPersistence();
@@ -34,8 +40,18 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         }
         private void DropInvalidated()
         { var keys = new HashSet<string>(outbox.Invalidated, StringComparer.Ordinal); pending.RemoveAll(x => outbox.BlockAll || keys.Contains(x.Key)); }
-        public void Reset(string account) { Builder.OnReset(account); dirty = true; RetryPersistence(); }
-        public void Disable(string account) { Builder.DropAccount(account); dirty = true; RetryPersistence(); }
+        public bool IsOpen(string positionKey)
+        {
+            if (positionKey == null) return false;
+            lock (positionsGate) return openPositions.Contains(positionKey);
+        }
+        private void PublishPositions()
+        {
+            var keys = new HashSet<string>(Builder.Open.Where(x => x.Net != 0).Select(x => x.Key), StringComparer.Ordinal);
+            lock (positionsGate) openPositions = keys;
+        }
+        public void Reset(string account) { Builder.OnReset(account); PublishPositions(); dirty = true; RetryPersistence(); }
+        public void Disable(string account) { Builder.DropAccount(account); PublishPositions(); dirty = true; RetryPersistence(); }
         public void PruneDisabledAccounts(Func<string, bool> isEnabled)
         {
             foreach (string account in Builder.Open.Select(x => x.Account).Distinct().Where(x => !isEnabled(x)).ToList())
@@ -47,7 +63,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         {
             using (outbox.EnterMutation())
             {
-                Builder.OnResync(account, snapshot);
+                Builder.OnResync(account, snapshot); PublishPositions();
                 var rejected = pending.Where(x => x.RequiresValidation && (x.Provenance == null || !x.Provenance.Complete || x.Provenance.Account == account) &&
                     (x.Provenance == null || !x.Provenance.VerifiedBy(account, snapshot))).Select(x => x.Key).ToList();
                 if (rejected.Count != 0) outbox.InvalidateRecords(rejected);

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 — source ready 2026-10-20
+
+Not compiled in NinjaTrader yet. Includes the 0.2.0 changes.
+
+- No reset pop-up while the account still has a position in that instrument. A reversal (buy 1, sell 2) still sends the closed trade and lists it with Reset, but the window waits. When the position goes flat, the window comes up once, for the newest closed trade; older ones keep Reset. Partial closes and two quick trades work as before; a position in another instrument or account does not block the reset.
+
 ## 0.2.0 — source ready 2026-10-19
 
 Not compiled in NinjaTrader yet. The Windows tests come first. Includes the 0.1.1 changes.

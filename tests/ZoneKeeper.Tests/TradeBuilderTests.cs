@@ -58,6 +58,33 @@ namespace ZoneKeeper.Tests
             Assert.Equal("flip", Assert.Single(next.EntryExecIds));
         }
         [Fact]
+        public void T6_ReversalTradeIsMarkedAndKnowsItsPosition()
+        {
+            var b = Builder(); b.OnAdd(Fixtures.Fill("a", true, 1, 100, 1));
+            var old = Assert.Single(b.OnAdd(Fixtures.Fill("flip", false, 2, 101, -1)));
+            Assert.True(old.Reversal); Assert.Equal(Helpers.PairKey("Sim101", "MNQ 12-26"), old.PositionKey);
+            var next = Assert.Single(b.OnAdd(Fixtures.Fill("end", true, 1, 100, 0)));
+            Assert.False(next.Reversal); Assert.Equal(old.PositionKey, next.PositionKey);
+            // Local only: never in the server JSON.
+            Assert.DoesNotContain("Reversal", Json.Write(old)); Assert.DoesNotContain("PositionKey", Json.Write(old));
+        }
+        [Fact]
+        public void FillCoordinatorKnowsWhichPositionsAreOpen()
+        {
+            var files = new MemoryFiles();
+            var fills = new FillCoordinator(Builder(), new OpenTradesFile("open", files, delegate { }), new OutboxQueue("queue", files, delegate { }));
+            string mnq = Helpers.PairKey("Sim101", "MNQ 12-26"), es = Helpers.PairKey("Sim101", "ES 12-26");
+            Assert.False(fills.IsOpen(mnq)); Assert.False(fills.IsOpen(null));
+            fills.Apply(Fixtures.Fill("a", true, 1, 100, 1)); Assert.True(fills.IsOpen(mnq)); Assert.False(fills.IsOpen(es));
+            fills.Apply(Fixtures.Fill("flip", false, 2, 101, -1)); Assert.True(fills.IsOpen(mnq));
+            fills.Apply(Fixtures.Fill("end", true, 1, 100, 0)); Assert.False(fills.IsOpen(mnq));
+            fills.Apply(Fixtures.Fill("b", true, 1, 100, 1)); fills.Reset("Sim101"); Assert.False(fills.IsOpen(mnq));
+            // A position open before ZoneKeeper started (unknown start) also counts.
+            fills.Resync("Sim101", Fixtures.Snapshot(new Fill[0], Fixtures.Position(2)));
+            Assert.True(fills.IsOpen(mnq));
+            fills.Disable("Sim101"); Assert.False(fills.IsOpen(mnq));
+        }
+        [Fact]
         public void T7_PartialFillThenReversal()
         {
             var b = Builder(); b.OnAdd(Fixtures.Fill("a", true, 2, 100, 2)); b.OnAdd(Fixtures.Fill("b", false, 1, 101, 1));

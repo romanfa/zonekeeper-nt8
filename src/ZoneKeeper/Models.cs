@@ -135,6 +135,10 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         public string LogExitNames { get; set; }
         public TradeProvenance Provenance { get; set; }
         public bool RequiresValidation { get; set; }
+        // Local only (reset raise rule): the exit fill left a position the other way open (a reversal), and the
+        // account + instrument key of the position (raw names). Not saved; null key = a trade restored from disk.
+        public bool Reversal { get; set; }
+        public string PositionKey { get; set; }
         public string Key { get { return Helpers.PairKey(Account, ExitExecId); } }
     }
 
@@ -224,6 +228,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 Currency = Currency, PointValue = (double)PointValue, ExitExecId = Helpers.SafeId(closingFill.ExecId),
                 EntryExecIds = new List<string>(EntryExecIds), ExitName = exitName.Length == 0 ? null : exitName,
                 LocalDate = Helpers.LocalDate(closingFill.TimeMs, localZone), LogExitNames = string.Join(", ", ExitNames),
+                Reversal = closingFill.PositionAfter != 0, PositionKey = Key,
                 Provenance = new TradeProvenance { Account = Account, Instrument = Instrument,
                     Executions = Fills.ConvertAll(x => x.Evidence == null ? null : x.Evidence.Copy()) }
             };
