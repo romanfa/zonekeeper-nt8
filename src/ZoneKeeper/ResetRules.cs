@@ -21,7 +21,9 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         // A trade is "fresh" for 10 minutes after its exit. Only fresh trades raise the window.
         public const long FreshMs = 600000;
         public const int OpenedLimit = 200;
-        // A reset the server keeps refusing with 404 / 5xx is tried this many times (5 s, 15 s, 30 s, then 60 s apart), then dropped.
+        // A reset the server answers with 404 / 405 / 410 (the route is gone) this many times is dropped. Other odd
+        // answers (5xx, 302, an unreadable 200) back off 5 s, 15 s, 30 s, then 60 s, forever: the server's own
+        // 13-hour "local" rule ends a stale reset with a 400, which is then dropped.
         public const int ResetMaxTries = 20;
         public const double DefaultWidth = 480, DefaultHeight = 720, MinWidth = 400, MinHeight = 560;
         private static readonly long[] retryWaits = { 5000, 15000, 30000, 60000 };

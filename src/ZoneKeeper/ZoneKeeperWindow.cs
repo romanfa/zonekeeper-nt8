@@ -271,7 +271,10 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             try { Dispatcher.InvokeAsync(new Action(() => Guard("Could not update the Today list", () => RefreshToday(true)))); }
             catch (Exception ex) { ZkEngine.ReportError("Could not dispatch a Today update", ex); }
         }
-        private void RefreshToday(bool force) { var task = RefreshTodayAsync(force); }
+        private void RefreshToday(bool force) { Forget(RefreshTodayAsync(force), "Could not refresh the list"); }
+        // A fire-and-forget task still reports its error.
+        private static void Forget(Task task, string context)
+        { task.ContinueWith(t => ZkEngine.ReportError(context, t.Exception == null ? new Exception("failed") : t.Exception.GetBaseException()), TaskContinuationOptions.OnlyOnFaulted); }
         // A forced refresh always ends with a fresh answer: a refresh in flight is awaited first, then a new one runs.
         private async Task RefreshTodayAsync(bool force)
         {
@@ -384,7 +387,7 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
                 if (row.State == RowState.Reset)
                 {
                     var button = new Button { Content = UiText.ResetButton, Padding = new Thickness(10, 2, 10, 2), IsEnabled = catalog != null && !running };
-                    button.Click += delegate { Guard("Could not open the reset", () => { if (catalog == null || panel.Running) return; var task = OpenResetAsync(trade); }); };
+                    button.Click += delegate { Guard("Could not open the reset", () => { if (catalog == null || panel.Running) return; Forget(OpenResetAsync(trade), "Could not open the reset"); }); };
                     right.Children.Add(button);
                 }
                 else right.Children.Add(new TextBlock { Text = row.State == RowState.Logged ? UiText.LoggedTag : UiText.SavingTag, VerticalAlignment = VerticalAlignment.Center });

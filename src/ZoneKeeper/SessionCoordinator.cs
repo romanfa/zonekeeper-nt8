@@ -307,8 +307,9 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         }
         private sealed class SavedReset { public ResetLine Line; public bool Logged; }
         // Answers (plan 31 section 2.5): 200 and 409 → gone, row Logged; 400 → gone, row back to Reset, one log line;
-        // 401 / 403 / 429 / no answer → the normal policy, the line waits. Any other server answer (404, 5xx, ...) is this
-        // line's own problem: it backs off (5 s, 15 s, 30 s, 60 s) and is dropped after ResetMaxTries, trade sending untouched.
+        // 401 / 403 / 429 / no answer → the normal policy, the line waits. Any other server answer is this line's own
+        // problem: it backs off (5 s, 15 s, 30 s, 60 s), trade sending untouched. Only 404 / 405 / 410 (the route is
+        // gone) count toward the drop after ResetMaxTries; 5xx, 302 and an unreadable 200 keep trying.
         private async Task<SavedReset> SendOneResetAsync(ResetLine line, long nowMs, CancellationToken cancellation)
         {
             var result = await api.SaveResetAsync(settings.Token, line.Body, cancellation).ConfigureAwait(false);
@@ -335,10 +336,11 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             else
             {
                 line.Attempts++;
-                if (line.Attempts >= ResetRules.ResetMaxTries)
+                if (result.Status == 404 || result.Status == 405 || result.Status == 410) line.GoneAnswers++;
+                if (line.GoneAnswers >= ResetRules.ResetMaxTries)
                 {
                     if (!resets.Remove(line.RequestId)) { Apply(new ApiResult { Kind = ApiKind.Offline }, nowMs); return null; }
-                    log.Write(UiText.ResetGaveUp(line.Attempts, (result.Status == 0 ? "" : result.Status.ToString(CultureInfo.InvariantCulture) + " ") + (result.Error ?? "")));
+                    log.Write(UiText.ResetGaveUp(line.GoneAnswers, result.Status.ToString(CultureInfo.InvariantCulture) + " " + (result.Error ?? "")));
                     ScheduleNextReset(nowMs);
                     done = new SavedReset { Line = line, Logged = false };
                 }

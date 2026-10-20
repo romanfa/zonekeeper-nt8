@@ -453,7 +453,33 @@ namespace ZoneKeeper.Tests
             }
         }
         [Fact]
-        public async Task R9_A404OrServerErrorBacksOffPerLineAndIsDroppedAfterTwentyTries()
+        public async Task R9_ServerErrorsBackOffPerLineForeverWithoutADrop()
+        {
+            using (var s = new Scope())
+            {
+                long now = Fixtures.Time;
+                await s.Step(now);
+                var body = s.QueueReset(812, now - 100000);
+                long[] waits = { 5000, 15000, 30000, 60000 };
+                int[] statuses = { 503, 500, 302, 200 };  // 200 = an unreadable answer (Kind Offline)
+                for (int attempt = 1; attempt <= 30; attempt++)
+                {
+                    s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.Offline, Status = statuses[attempt % statuses.Length], Error = "odd" });
+                    await s.Step(now);
+                    long wait = waits[Math.Min(attempt - 1, waits.Length - 1)];
+                    Assert.Equal(attempt, s.Api.Resets); Assert.Equal(ZkStatus.Connected, s.Session.Snapshot().Status);
+                    Assert.Equal(now + wait, s.Session.Snapshot().NextTryMs); Assert.Equal(1, s.Resets.Count); Assert.Empty(s.Saved);
+                    now += wait;
+                }
+                Assert.DoesNotContain(s.Log.Recent, x => x.Contains("Gave up"));
+                // The server's own 13 h rule ends it: a 400 drops it as today.
+                s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.BadRequest, Status = 400, Error = "local time is too far from now" });
+                await s.Step(now);
+                Assert.Equal(0, s.Resets.Count); Assert.Equal(new[] { "812:refused" }, s.Saved.ToArray()); Assert.Equal(body.RequestId, s.Api.ResetBodies[30].RequestId);
+            }
+        }
+        [Fact]
+        public async Task R9_A404BacksOffPerLineAndIsDroppedAfterTwentyTries()
         {
             using (var s = new Scope())
             {
@@ -463,7 +489,7 @@ namespace ZoneKeeper.Tests
                 long[] waits = { 5000, 15000, 30000, 60000 };
                 for (int attempt = 1; attempt < ResetRules.ResetMaxTries; attempt++)
                 {
-                    s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.Offline, Status = attempt % 2 == 0 ? 503 : 404, Error = "not found" });
+                    s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.Offline, Status = attempt % 3 == 0 ? 405 : 404, Error = "not found" });
                     await s.Step(now);
                     long wait = waits[Math.Min(attempt - 1, waits.Length - 1)];
                     // The connection is untouched: Connected, the loop wakes at the line's retry time, nothing else is tried before.
@@ -472,13 +498,16 @@ namespace ZoneKeeper.Tests
                     await s.Step(now + wait - 1); Assert.Equal(attempt, s.Api.Resets);
                     now += wait;
                 }
-                // A trade in between goes first and is not slowed down; the 20th failure drops the line with one log line.
-                s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.Offline, Status = 503, Error = "not found" });
+                // A 503 in between does not count toward the drop (still 19 "gone" answers).
+                s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.Offline, Status = 503, Error = "busy" });
+                await s.Step(now); Assert.Equal(1, s.Resets.Count); Assert.Empty(s.Saved); now += 60000;
+                // A trade in between goes first and is not slowed down; the 20th 404 drops the line with one log line.
+                s.Api.ResetAnswers.Enqueue(new ApiResult { Kind = ApiKind.Offline, Status = 410, Error = "not found" });
                 s.Queue.Add(Fixtures.Trade()); await s.Step(now);
-                Assert.Equal(1, s.Api.Sends); Assert.Equal(0, s.Queue.Count); Assert.Equal(ResetRules.ResetMaxTries, s.Api.Resets);
+                Assert.Equal(1, s.Api.Sends); Assert.Equal(0, s.Queue.Count); Assert.Equal(ResetRules.ResetMaxTries + 1, s.Api.Resets);
                 Assert.Equal(body.RequestId, s.Api.ResetBodies[s.Api.ResetBodies.Count - 1].RequestId);
                 Assert.Equal(0, s.Resets.Count); Assert.Equal(new[] { "812:refused" }, s.Saved.ToArray());
-                Assert.Equal(1, s.Log.Recent.Count(x => x.Contains("Gave up on a reset after 20 tries: 503 not found")));
+                Assert.Equal(1, s.Log.Recent.Count(x => x.Contains("Gave up on a reset after 20 tries: 410 not found")));
                 Assert.Equal(ZkStatus.Connected, s.Session.Snapshot().Status);
                 // No answer at all (status 0) is still the connection policy.
                 s.QueueReset(813, now - 50000);

@@ -15,8 +15,10 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
         [DataMember(Name = "exit_time")] public long ExitTime { get; set; }
         [DataMember(Name = "queued_at")] public long QueuedAt { get; set; }
         [DataMember(Name = "body")] public ResetBody Body { get; set; }
-        // Retry state for this engine run only (not saved): 404 / 5xx answers back off per line.
+        // Retry state for this engine run only (not saved): server answers that are this line's own problem back off per line.
         public int Attempts { get; set; }
+        // 404 / 405 / 410 answers only: after ResetMaxTries of them the line is dropped. Other answers never drop it.
+        public int GoneAnswers { get; set; }
         public long NextTryMs { get; set; }
     }
 

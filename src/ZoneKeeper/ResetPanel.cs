@@ -55,8 +55,8 @@ namespace NinjaTrader.NinjaScript.AddOns.ZoneKeeper
             back.Click += delegate { Guard("Could not close the reset", () => Close(true)); };
             timer.Tick += delegate { Guard("Could not run the reset timer", TimerTick); };
         }
-        // A reset counts as running once a tilt was tapped. A new trade never interrupts it.
-        public bool Running { get { return Session != null && !Session.Interruptible && !Session.IsSaved; } }
+        // A reset counts as running once a tilt was tapped, and while its save is being written. A new trade never interrupts it.
+        public bool Running { get { return saving || (Session != null && !Session.Interruptible && !Session.IsSaved); } }
 
         public void Open(Catalog catalog, TodayTrade trade)
         {
